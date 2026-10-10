@@ -838,7 +838,7 @@ impl KeyBasedFileGroupRecordBuffer {
     fn process_data_record(
         &mut self,
         record: BufferedRecord,
-        key: &str,
+        key: String,
         inc_is_partial: bool,
     ) -> Result<()> {
         self.base.total_log_records += 1;
@@ -868,7 +868,7 @@ impl KeyBasedFileGroupRecordBuffer {
             // deferred to spill only).
             let merger = &self.base.buffered_record_merger;
             let commit_time_ordering = self.base.record_merge_mode == "COMMIT_TIME_ORDERING";
-            self.base.records.merge_in_place(key, |existing| {
+            self.base.records.merge_in_place_owned(key, |existing| {
                 // Folding needs columns on both sides. With no prior, or a prior that
                 // is a delete tombstone, the ordering comparison alone decides.
                 let Some((prior, prior_batch, ib)) = existing
@@ -908,7 +908,7 @@ impl KeyBasedFileGroupRecordBuffer {
             // The fill only rewrites default/sentinel columns and never touches
             // `ordering_value`, so it cannot change the winner; a same-ordering tie
             // keeps the incoming (new) as the winner, matching `should_keep_newer_record`.
-            let stored = match self.base.records.get(key)? {
+            let stored = match self.base.records.get(&key)? {
                 None => record, // no prior: nothing to fill from; store as-is.
                 Some(prior) => {
                     let new_wins = self.base.record_merge_mode == "COMMIT_TIME_ORDERING"
@@ -929,7 +929,7 @@ impl KeyBasedFileGroupRecordBuffer {
                     }
                 }
             };
-            self.base.records.insert(key.to_string(), stored)?;
+            self.base.records.insert(key, stored)?;
         } else {
             // Plain (non-partial) log-vs-log merge. Single-probe merge (perf): probe
             // `key` once via `merge_in_place` and overwrite in place. The merger only
@@ -939,7 +939,7 @@ impl KeyBasedFileGroupRecordBuffer {
             let merger = &self.base.buffered_record_merger;
             self.base
                 .records
-                .merge_in_place(key, |existing| merger.delta_merge(&record, existing))?;
+                .merge_in_place_owned(key, |existing| merger.delta_merge(&record, existing))?;
         }
 
         // Track peak merge-map size.
@@ -1631,7 +1631,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                     // A delete tombstone carries no columns, so it is never
                     // partial whatever its block's schema says.
                     let record_is_partial = is_partial && !record.is_delete();
-                    self.process_data_record(record, &key, record_is_partial)?;
+                    self.process_data_record(record, key, record_is_partial)?;
                 }
             }
         }
@@ -1654,7 +1654,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
             (Some(ib), Some(target)) => schema_is_partial(&ib.schema(), target),
             _ => false,
         };
-        self.process_data_record(record, key, inc_is_partial)
+        self.process_data_record(record, key.to_string(), inc_is_partial)
     }
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.processDeleteBlock(HoodieDeleteBlock)`.
     ///
