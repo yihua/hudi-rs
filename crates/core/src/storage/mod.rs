@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use object_store::path::Path as ObjPath;
 use object_store::{
     ObjectStore, ObjectStoreExt, ObjectStoreScheme, PutMode, PutOptions, PutPayload, parse_url_opts,
@@ -47,6 +48,8 @@ pub mod error;
 pub(crate) mod fault;
 pub mod file_metadata;
 pub mod reader;
+#[cfg(test)]
+pub(crate) mod recording;
 pub mod util;
 
 /// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
@@ -309,7 +312,12 @@ impl Storage {
         #[cfg(test)]
         OBJECT_STORES_BUILT.with(|n| n.set(n.get() + 1));
         match parse_url_opts(base_url, options) {
-            Ok((object_store, _)) => Ok(Arc::from(object_store)),
+            Ok((object_store, _)) => {
+                let object_store: Arc<dyn ObjectStore> = Arc::from(object_store);
+                #[cfg(test)]
+                let object_store = recording::wrap_if_recording(object_store);
+                Ok(object_store)
+            }
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
     }
@@ -393,11 +401,22 @@ impl Storage {
     }
 
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
+        let (bytes, _) = self.get_file_data_and_last_modified(relative_path).await?;
+        Ok(bytes)
+    }
+
+    /// The file's bytes and the store's last-modified time for them, from one
+    /// GET.
+    pub(crate) async fn get_file_data_and_last_modified(
+        &self,
+        relative_path: &str,
+    ) -> Result<(Bytes, DateTime<Utc>)> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let result = self.object_store.get(&obj_path).await?;
+        let last_modified = result.meta.last_modified;
         let bytes = result.bytes().await?;
-        Ok(bytes)
+        Ok((bytes, last_modified))
     }
 
     pub async fn get_file_data_from_absolute_path(&self, absolute_path: &str) -> Result<Bytes> {
@@ -459,6 +478,16 @@ impl Storage {
     }
 
     pub async fn list_files(&self, subdir: Option<&str>) -> Result<Vec<FileMetadata>> {
+        let (file_metadata, _) = self.list_files_with_latest_modified(subdir).await?;
+        Ok(file_metadata)
+    }
+
+    /// [`Self::list_files`], with the store's latest last-modified time among
+    /// the listed files, or `None` when none is listed.
+    pub(crate) async fn list_files_with_latest_modified(
+        &self,
+        subdir: Option<&str>,
+    ) -> Result<(Vec<FileMetadata>, Option<DateTime<Utc>>)> {
         let prefix_url = join_url_segments(&self.base_url, &[subdir.unwrap_or_default()])?;
         let prefix_path = ObjPath::from_url_path(prefix_url.path())?;
         let list_res = self
@@ -466,6 +495,7 @@ impl Storage {
             .list_with_delimiter(Some(&prefix_path))
             .await?;
         let mut file_metadata = Vec::new();
+        let mut latest_modified = None;
         for obj_meta in list_res.objects {
             let location = obj_meta.location;
             let name = location
@@ -476,9 +506,10 @@ impl Storage {
                 continue;
             }
 
+            latest_modified = latest_modified.max(Some(obj_meta.last_modified));
             file_metadata.push(FileMetadata::new(name.to_string(), obj_meta.size));
         }
-        Ok(file_metadata)
+        Ok((file_metadata, latest_modified))
     }
 
     /// Resolve a relative path to an [`ObjPath`] under this storage's base URL.
