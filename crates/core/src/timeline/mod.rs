@@ -42,7 +42,7 @@ use crate::statistics::estimator::FileStatsEstimator;
 use crate::storage::Storage;
 use crate::timeline::builder::TimelineBuilder;
 use crate::timeline::instant::{Action, State};
-use crate::timeline::loader::TimelineLoader;
+use crate::timeline::loader::{PrelistedTimeline, TimelineLoader};
 use crate::timeline::selector::TimelineSelector;
 use crate::timeline::view::TimelineView;
 use arrow_schema::Schema;
@@ -117,9 +117,13 @@ impl Timeline {
         }
     }
 
+    /// Builds the timeline and loads its active instants, using `prelisted`
+    /// in place of listing the active timeline when it covers the same
+    /// directory (see [`TimelineLoader::load_instants_with_listing`]).
     pub(crate) async fn new_from_storage(
         hudi_configs: Arc<HudiConfigs>,
         storage: Arc<Storage>,
+        prelisted: Option<PrelistedTimeline>,
     ) -> Result<Self> {
         let mut timeline = TimelineBuilder::new(hudi_configs, storage).build().await?;
         // Every state, not just completed: one listing then yields both the
@@ -133,7 +137,10 @@ impl Timeline {
             None,
             None,
         )?;
-        let all_active = timeline.load_instants(&selector, false).await?;
+        let all_active = timeline
+            .active_loader
+            .load_instants_with_listing(&selector, false, prelisted)
+            .await?;
         timeline.set_active_instants(all_active);
         Ok(timeline)
     }
@@ -1018,7 +1025,7 @@ mod tests {
             base_url.to_string(),
         )]));
         let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
-        let timeline = Timeline::new_from_storage(hudi_configs, storage)
+        let timeline = Timeline::new_from_storage(hudi_configs, storage, None)
             .await
             .unwrap();
 
