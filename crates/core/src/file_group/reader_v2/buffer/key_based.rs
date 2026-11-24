@@ -587,7 +587,7 @@ impl KeyBasedFileGroupRecordBuffer {
                 arrow::compute::max(positions),
             )
             && lo >= 0
-            && filter.range(lo as u64..=hi as u64).next().is_none()
+            && filter.range_cardinality(lo as u64..=hi as u64) == 0
         {
             return Ok(Some(if base.schema() == *target_schema {
                 base.clone()
