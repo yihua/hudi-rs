@@ -537,6 +537,14 @@ where
     }
 }
 
+/// Bytes fetched from the end of a file for its footer in one request.
+///
+/// Without a hint the reader asks for the 8-byte footer length first and then
+/// for the footer, two round trips per file. 512 KiB holds the footer of a
+/// typical base file, and a larger one costs one more request than it did
+/// before, not more.
+const FOOTER_SIZE_HINT: usize = 512 * 1024;
+
 /// The builder every read here is driven from: a parquet object reader that
 /// splits large reads, with the read-volume counters and the row-group prefetch
 /// wrapped around it.
@@ -590,7 +598,8 @@ impl ParquetBaseFileReader {
     ) -> Result<(CountedBuilder, ReadPlanCell)> {
         #[allow(deprecated)]
         let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
-            .with_file_size(file_size);
+            .with_file_size(file_size)
+            .with_footer_size_hint(FOOTER_SIZE_HINT);
 
         // A parquet-avro writer with `write-old-list-structure=true` encodes an
         // `array<map>` as a legacy 2-level list whose element is a REPEATED map

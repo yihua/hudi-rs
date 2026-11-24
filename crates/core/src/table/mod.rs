@@ -4126,8 +4126,8 @@ mod tests {
         assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
         assert_eq!(without_size.0, 1, "an unknown size costs one metadata lookup");
         assert!(
-            with_size.1 <= 2 + row_groups,
-            "one footer fetch (two requests) plus one per row group, got {} gets for {row_groups} row groups",
+            with_size.1 <= 1 + row_groups,
+            "one footer fetch plus one per row group, got {} gets for {row_groups} row groups",
             with_size.1
         );
         assert_eq!(with_size.1, without_size.1);
@@ -4154,8 +4154,8 @@ mod tests {
         assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
         assert_eq!(without_size.0, 1, "an unknown size costs one metadata lookup");
         assert!(
-            with_size.1 <= 2 + row_groups * 2,
-            "one footer fetch (two requests) plus the merge's column chunks, got {} gets for {row_groups} row groups",
+            with_size.1 <= 1 + row_groups * 2,
+            "one footer fetch plus the merge's column chunks, got {} gets for {row_groups} row groups",
             with_size.1
         );
         assert_eq!(sized_rows, looked_up_rows);
