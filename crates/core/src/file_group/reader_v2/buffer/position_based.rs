@@ -105,7 +105,9 @@ impl PositionBasedFileGroupRecordBuffer {
         emit_delete: bool,
         base_file_instant_time: String,
     ) -> Result<Self> {
-        let inner = KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
+        let mut inner =
+            KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
+        inner.position_filter = Some(roaring::RoaringTreemap::new());
         Ok(Self {
             inner,
             base_file_instant_time,
@@ -120,6 +122,28 @@ impl PositionBasedFileGroupRecordBuffer {
     /// fallback, record keys after), so the string domains do not collide.
     fn position_key(position: u64) -> String {
         position.to_string()
+    }
+
+    /// Record that `position` has a buffered log record, so the merge kernel
+    /// looks base rows at that position up in the merge map.
+    fn note_position(&mut self, position: u64) {
+        if let Some(filter) = self.inner.position_filter.as_mut() {
+            filter.insert(position);
+        }
+    }
+
+    /// [`Self::note_position`] for a map key handed in from outside the
+    /// block loops. While the buffer merges by position every key is a
+    /// decimal position. A key that does not parse can't be skipped safely,
+    /// so the filter is dropped and every base row is looked up.
+    fn note_position_key(&mut self, key: &str) {
+        if !self.should_use_position {
+            return;
+        }
+        match key.parse::<u64>() {
+            Ok(position) => self.note_position(position),
+            Err(_) => self.inner.position_filter = None,
+        }
     }
 
     /// Extract the block's record positions, validating the base-file instant.
@@ -169,6 +193,7 @@ impl PositionBasedFileGroupRecordBuffer {
             return Ok(());
         }
         self.should_use_position = false;
+        self.inner.position_filter = None;
 
         // Rebuild the (possibly-spilled) position-keyed map as a record-key-keyed
         // map. `drain_iter` yields values; the position keys are dropped.
@@ -384,6 +409,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                         ))
                     })?;
                     pos_idx += 1;
+                    self.note_position(position);
                     self.inner
                         .process_next_data_record(record, &Self::position_key(position))?;
                 }
@@ -399,6 +425,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn process_next_data_record(&mut self, record: BufferedRecord, key: &str) -> Result<()> {
+        self.note_position_key(key);
         self.inner.process_next_data_record(record, key)
     }
 
@@ -439,6 +466,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                         record_key,
                         ordering_value,
                     };
+                    self.note_position(position);
                     self.inner.process_next_deleted_record(
                         delete_record,
                         &Self::position_key(position),
@@ -460,6 +488,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         delete_record: DeleteRecord,
         key: &str,
     ) -> Result<()> {
+        self.note_position_key(key);
         self.inner.process_next_deleted_record(delete_record, key)
     }
 
@@ -1030,6 +1059,60 @@ mod tests {
                 ("x".into(), 55, 7), // inserted (position 5, beyond base)
             ]
         );
+    }
+
+    /// Base rows whose positions have no log record skip the merge-map lookup:
+    /// a batch with none of them is returned whole, and inside a batch with
+    /// some, only those rows are looked up. The result must equal the merge
+    /// that looks every row up.
+    #[test]
+    fn position_filter_skips_untouched_rows_and_batches() {
+        fn run(use_filter: bool) -> Vec<(String, i32, i64)> {
+            let mut buffer = build_buffer();
+            // Update positions 2 and 7, delete position 5. Positions 10..15
+            // (the second batch) are untouched.
+            let mut block = data_block_with_positions(
+                &[("k2", 200, 9), ("k7", 700, 9)],
+                &[2, 7],
+                BASE_INSTANT,
+            );
+            buffer.process_data_block(&mut block).unwrap();
+            let mut delete = delete_block_with_positions(&["k5"], &[5], BASE_INSTANT);
+            buffer.process_delete_block(&mut delete).unwrap();
+            if use_filter {
+                let filter = buffer.inner.position_filter.as_ref().unwrap();
+                assert_eq!(filter.iter().collect::<Vec<_>>(), vec![2, 5, 7]);
+            } else {
+                buffer.inner.position_filter = None;
+            }
+            let keys: Vec<String> = (0..15).map(|i| format!("k{i}")).collect();
+            let rows: Vec<(&str, i32, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i as i32, 1))
+                .collect();
+            let (first, second) = rows.split_at(10);
+            let target = schema();
+            let mut all: Vec<RecordBatch> = Vec::new();
+            for batch in [base_batch_at(first, 0), base_batch_at(second, 10)] {
+                if let Some(out) = buffer.merge_base_batch(&batch, &target).unwrap() {
+                    all.push(out);
+                }
+            }
+            while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+                all.push(b);
+            }
+            let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+            let mut rows = extract(&merged);
+            rows.sort();
+            rows
+        }
+        let filtered = run(true);
+        assert_eq!(filtered, run(false));
+        assert_eq!(filtered.len(), 14, "one of 15 base rows is deleted");
+        assert!(filtered.contains(&("k2".to_string(), 200, 9)));
+        assert!(filtered.contains(&("k7".to_string(), 700, 9)));
+        assert!(!filtered.iter().any(|(k, _, _)| k == "k5"));
     }
 
     /// Two data blocks from consecutive commits both target the SAME base
