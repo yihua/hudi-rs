@@ -29,6 +29,10 @@ path = "src/main.rs"
 name = "fg-gen"
 path = "src/gen.rs"
 
+[[bin]]
+name = "read-compare"
+path = "src/compare.rs"
+
 [dependencies]
 apache-avro = { workspace = true }
 arrow-array = { workspace = true }
@@ -39,6 +43,8 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 hudi-core = { path = "../../crates/core" }
 libc = "0.2"
+object_store = { workspace = true }
+pprof = { version = "0.15", features = ["flamegraph"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
