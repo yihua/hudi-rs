@@ -2368,7 +2368,10 @@ mod tests {
         .unwrap();
         // The size of the filter a Hudi writer stores at its default 60,000
         // entries and a 1e-9 false-positive rate.
-        let bloom = KeyValue::new("org.apache.hudi.bloomfilter".to_string(), "A".repeat(862_724));
+        let bloom = KeyValue::new(
+            "org.apache.hudi.bloomfilter".to_string(),
+            "A".repeat(862_724),
+        );
         let properties = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![bloom]))
             .build();
@@ -2381,7 +2384,10 @@ mod tests {
 
         let memory = object_store::memory::InMemory::new();
         memory
-            .put(&ObjPath::from("table/bloom.parquet"), PutPayload::from(bytes))
+            .put(
+                &ObjPath::from("table/bloom.parquet"),
+                PutPayload::from(bytes),
+            )
             .await
             .unwrap();
         let (store, counts) = CountingObjectStore::new(Arc::new(memory));
