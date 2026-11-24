@@ -2464,6 +2464,40 @@ mod tests {
         assert!(!ctx.is_delete_record(&batch, 1, Some(&delete_ctx)));
     }
 
+    /// A projected read's reader schema appends `_hoodie_operation` after the
+    /// projection, while a log block is decoded at its writer schema, where the
+    /// field sits elsewhere. The operation marker must be read from the batch's
+    /// own `_hoodie_operation`, not from whatever column holds the reader
+    /// schema's position.
+    #[test]
+    fn test_operation_marker_is_read_by_name_when_the_reader_schema_is_narrower() {
+        let ctx = RecordContext::default();
+        let reader_schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("_hoodie_operation", DataType::Utf8, true),
+        ]));
+        let delete_ctx = DeleteContext::from_reader_schema(reader_schema);
+        assert_eq!(delete_ctx.hoodie_operation_pos, Some(1));
+
+        let writer_schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("_hoodie_operation", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            writer_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["k1", "k2"])),
+                Arc::new(StringArray::from(vec!["open", "D"])),
+                Arc::new(StringArray::from(vec!["D", "U"])),
+            ],
+        )
+        .unwrap();
+
+        assert!(ctx.is_delete_record(&batch, 0, Some(&delete_ctx)));
+        assert!(!ctx.is_delete_record(&batch, 1, Some(&delete_ctx)));
+    }
+
     #[test]
     fn test_default_record_context() {
         let ctx = RecordContext::default();
