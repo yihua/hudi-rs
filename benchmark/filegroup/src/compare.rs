@@ -293,9 +293,70 @@ fn print_profile(report: &pprof::Report, top: usize) {
     let mut i: Vec<_> = incl.into_iter().collect();
     i.sort_by(|a, b| b.1.cmp(&a.1));
     println!("PROFILE top inclusive:");
-    for (n, c) in i.iter().take(top * 2) {
+    for (n, c) in i
+        .iter()
+        .filter(|(n, _)| !BORING.iter().any(|b| n.contains(b)))
+        .take(top * 2)
+    {
         println!("PROFILE incl {:5.1}% {}", 100.0 * *c as f64 / total as f64, n);
     }
+    // Stacks, leaf first, cut to the first few frames that name a function of
+    // interest, so a hot leaf (an atomic add, a memcpy) shows who called it.
+    let mut stacks: HashMap<String, i64> = HashMap::new();
+    for (frames, count) in report.data.iter() {
+        let names: Vec<String> = frames
+            .frames
+            .iter()
+            .flat_map(|f| f.iter().map(|s| short_fn(&s.name())))
+            .filter(|n| !BORING.iter().any(|b| n.contains(b)))
+            .take(8)
+            .collect();
+        *stacks.entry(names.join(" <- ")).or_default() += *count as i64;
+    }
+    let mut st: Vec<_> = stacks.into_iter().collect();
+    st.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("PROFILE top stacks:");
+    for (n, c) in st.iter().take(top + 15) {
+        println!("PROFILE stack {:5.1}% {}", 100.0 * *c as f64 / total as f64, n);
+    }
+}
+
+const BORING: &[&str] = &[
+    "poll",
+    "catch_unwind",
+    "call_once",
+    "block_on",
+    "lang_start",
+    "_start",
+    "main",
+    "with_budget",
+    "budget",
+    "enter_runtime",
+    "async_block",
+    "async_fn",
+    "{closure",
+    "__rust_begin_short_backtrace",
+    "try_next",
+    "next_inner",
+    "into_future",
+];
+
+/// A symbol without generics, cut to its last two path segments, so stacks stay short.
+fn short_fn(name: &str) -> String {
+    let n = name.split("::h").next().unwrap_or(name);
+    let mut depth = 0i32;
+    let mut plain = String::new();
+    for ch in n.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 => plain.push(ch),
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = plain.split("::").filter(|p| !p.is_empty()).collect();
+    let k = parts.len().saturating_sub(2);
+    parts[k..].join("::")
 }
 
 fn main() {
@@ -316,32 +377,23 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    for it in 0..args.iterations {
-        let last = it + 1 == args.iterations;
-        let guard = if last && args.profile.is_some() {
-            Some(
-                pprof::ProfilerGuardBuilder::default()
-                    .frequency(499)
-                    .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                    .build()
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-        ALLOCS.store(0, Ordering::Relaxed);
-        ALLOC_BYTES.store(0, Ordering::Relaxed);
-        COUNT_ON.store(args.count_allocs, Ordering::Relaxed);
-        let before = rusage::Rusage::capture();
-        let start = Instant::now();
-        let (rows, batches) = runtime.block_on(async {
+    let run_once = || {
+        runtime.block_on(async {
             match args.mode.as_str() {
                 "hudi" => run_hudi(&args, &slices, true).await,
                 "hudi-base" => run_hudi(&args, &slices, false).await,
                 "parquet" => run_parquet(&args, &slices).await,
                 m => panic!("unknown mode {m}"),
             }
-        });
+        })
+    };
+    for it in 0..args.iterations {
+        ALLOCS.store(0, Ordering::Relaxed);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        COUNT_ON.store(args.count_allocs, Ordering::Relaxed);
+        let before = rusage::Rusage::capture();
+        let start = Instant::now();
+        let (rows, batches) = run_once();
         let wall = start.elapsed();
         COUNT_ON.store(false, Ordering::Relaxed);
         let d = rusage::Rusage::capture().delta(&before);
@@ -362,13 +414,21 @@ fn main() {
             ALLOC_BYTES.load(Ordering::Relaxed) / (1 << 20),
             d.max_rss_kb / 1024
         );
-        if let Some(guard) = guard {
-            let report = guard.report().build().unwrap();
-            if let Some(path) = &args.profile {
-                let file = std::fs::File::create(path).unwrap();
-                report.flamegraph(file).unwrap();
-            }
-            print_profile(&report, 25);
+    }
+    // Profile separate, untimed iterations so the sampler does not skew the
+    // numbers above.
+    if let Some(path) = &args.profile {
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(2999)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .unwrap();
+        for _ in 0..5 {
+            run_once();
         }
+        let report = guard.report().build().unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        report.flamegraph(file).unwrap();
+        print_profile(&report, 25);
     }
 }
