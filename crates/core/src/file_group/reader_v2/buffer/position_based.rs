@@ -1071,11 +1071,8 @@ mod tests {
             let mut buffer = build_buffer();
             // Update positions 2 and 7, delete position 5. Positions 10..15
             // (the second batch) are untouched.
-            let mut block = data_block_with_positions(
-                &[("k2", 200, 9), ("k7", 700, 9)],
-                &[2, 7],
-                BASE_INSTANT,
-            );
+            let mut block =
+                data_block_with_positions(&[("k2", 200, 9), ("k7", 700, 9)], &[2, 7], BASE_INSTANT);
             buffer.process_data_block(&mut block).unwrap();
             let mut delete = delete_block_with_positions(&["k5"], &[5], BASE_INSTANT);
             buffer.process_delete_block(&mut delete).unwrap();
