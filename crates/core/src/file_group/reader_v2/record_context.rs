@@ -1101,18 +1101,30 @@ impl RecordContext {
         row_idx: usize,
         delete_context: Option<&DeleteContext>,
     ) -> bool {
-        // Use pre-computed position from DeleteContext if available
-        let col_idx = if let Some(ctx) = delete_context {
-            match ctx.hoodie_operation_pos {
-                Some(pos) => pos,
-                None => return false, // field not in schema
-            }
-        } else {
-            // Fallback: inline schema lookup
-            match batch.schema().column_with_name("_hoodie_operation") {
+        // The position comes from the reader schema, but a log block is decoded at
+        // its writer schema, which a projected reader schema orders differently:
+        // the position is trusted only when this batch has the field there.
+        let schema = batch.schema();
+        let col_idx = match delete_context {
+            Some(ctx) => match ctx.hoodie_operation_pos {
+                Some(pos)
+                    if schema
+                        .fields()
+                        .get(pos)
+                        .is_some_and(|f| f.name() == "_hoodie_operation") =>
+                {
+                    pos
+                }
+                Some(_) => match schema.column_with_name("_hoodie_operation") {
+                    Some((idx, _)) => idx,
+                    None => return false,
+                },
+                None => return false, // field not in the reader schema
+            },
+            None => match schema.column_with_name("_hoodie_operation") {
                 Some((idx, _)) => idx,
                 None => return false,
-            }
+            },
         };
 
         if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>()
