@@ -1076,8 +1076,7 @@ impl FileGroupReader {
         // Reconciling needs the base file's own columns, which only its footer
         // can say. The projection is therefore chosen from inside the open, so
         // the footer that answers the schema also serves the read.
-        let target_slot: Arc<std::sync::Mutex<Option<Arc<arrow_schema::Schema>>>> =
-            Arc::default();
+        let target_slot: Arc<std::sync::Mutex<Option<Arc<arrow_schema::Schema>>>> = Arc::default();
         let base_stream = if self.data_schema_override.is_some() && !relative_path.is_empty() {
             let slot = target_slot.clone();
             let read_projection = read_projection.clone();

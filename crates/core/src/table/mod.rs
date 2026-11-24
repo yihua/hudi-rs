@@ -4124,7 +4124,10 @@ mod tests {
             looked_up_rows,
         } = base_file_requests(&fixture, ReadOptions::new(), false).await;
         assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
-        assert_eq!(without_size.0, 1, "an unknown size costs one metadata lookup");
+        assert_eq!(
+            without_size.0, 1,
+            "an unknown size costs one metadata lookup"
+        );
         assert!(
             with_size.1 <= 1 + row_groups,
             "one footer fetch plus one per row group, got {} gets for {row_groups} row groups",
@@ -4152,7 +4155,10 @@ mod tests {
             looked_up_rows,
         } = base_file_requests(&fixture, options, true).await;
         assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
-        assert_eq!(without_size.0, 1, "an unknown size costs one metadata lookup");
+        assert_eq!(
+            without_size.0, 1,
+            "an unknown size costs one metadata lookup"
+        );
         assert!(
             with_size.1 <= 1 + row_groups * 2,
             "one footer fetch plus the merge's column chunks, got {} gets for {row_groups} row groups",

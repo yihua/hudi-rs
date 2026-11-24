@@ -142,7 +142,11 @@ impl ObjectStore for CountingObjectStore {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
         }
         {
-            let mut by_path = self.counts.by_path.lock().unwrap_or_else(|p| p.into_inner());
+            let mut by_path = self
+                .counts
+                .by_path
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let entry = by_path.entry(location.to_string()).or_default();
             if options.head {
                 entry.0 += 1;
