@@ -403,6 +403,13 @@ impl KeyBasedFileGroupRecordBuffer {
         })
     }
 
+    /// Whether the table carries a partial-update rule (`IGNORE_DEFAULTS` or an
+    /// unavailable-value sentinel) that reads the prior row when a log record
+    /// wins.
+    pub(super) fn has_partial_update_rules(&self) -> bool {
+        self.ignore_defaults || self.unavailable_value.is_some()
+    }
+
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.hasNextBaseRecord(T baseRecord)`.
     ///
     /// Looks up the record key in the records map, removes it if found,

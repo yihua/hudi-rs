@@ -38,6 +38,21 @@
 //! keys in the existing `String`-keyed spillable map; the map holds a single key
 //! domain at any instant — positions before fallback, record keys after.
 //!
+//! ## Direct merge
+//!
+//! Under commit-time ordering, with no partial-update rule and no delete
+//! marker other than `_hoodie_is_deleted`, the newest log record at a position
+//! simply replaces the base row there, and a delete simply removes it. While
+//! that holds, log blocks are kept as they arrive instead of being turned into
+//! records one by one. When the base is read, they are folded in log order into
+//! one sorted position list (a later block wins). Each base batch is then
+//! merged by finding that list's positions among the batch's row positions:
+//! the matched rows are masked out and the log rows that replace them are
+//! gathered in one call. The record map is never touched. Anything outside
+//! those conditions (a partial block, a block without usable positions, a
+//! caller using the row-at-a-time path) replays the kept blocks into the map
+//! and continues the ordinary way.
+//!
 //! ## Fallback to key-based
 //!
 //! When a log block has no valid positions (missing / mismatched base-file
@@ -49,7 +64,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
 
 use crate::Result;
@@ -59,7 +75,10 @@ use crate::file_group::reader_v2::buffer::key_based::{BaseMatch, KeyBasedFileGro
 use crate::file_group::reader_v2::buffer::record_positions::{
     base_row_position_array, decode_record_positions,
 };
-use crate::file_group::reader_v2::buffer::row_extraction::records_to_batch;
+use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
+use crate::file_group::reader_v2::buffer::row_extraction::{
+    reconcile_batch_to_schema, records_to_batch,
+};
 use crate::file_group::reader_v2::buffer::spillable_map::{SpillConfig, SpillableRecordMap};
 use crate::file_group::reader_v2::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord};
@@ -92,6 +111,57 @@ pub struct PositionBasedFileGroupRecordBuffer {
     /// Position-only deletes retained across a fallback (see
     /// [`needs_hybrid_strategy`](Self::needs_hybrid_strategy)).
     hybrid_deletes: HashMap<u64, BufferedRecord>,
+    /// The direct merge's state while it applies (see the module docs);
+    /// `None` once the buffer merges through the record map.
+    direct: Option<DirectMerge>,
+}
+
+/// Log blocks kept for the direct merge, and the position list built from them.
+#[derive(Debug)]
+struct DirectMerge {
+    blocks: Vec<DirectBlock>,
+    index: Option<DirectIndex>,
+    /// Bytes of log batches kept so far.
+    bytes: usize,
+    /// The merge map's in-memory budget. The kept blocks can't spill, so past
+    /// this they are handed to the record map, which can.
+    budget: u64,
+}
+
+/// One log block as it arrived, with its validated record positions.
+#[derive(Debug)]
+enum DirectBlock {
+    Data {
+        positions: Vec<u64>,
+        batches: Vec<RecordBatch>,
+    },
+    Delete {
+        positions: Vec<u64>,
+        batches: Vec<(RecordBatch, String)>,
+    },
+}
+
+/// What the newest log record at a position does to the base row there.
+#[derive(Clone, Copy, Debug)]
+enum DirectSlot {
+    /// Replace it with row `row` of `DirectIndex::data[batch]`.
+    Update { batch: u32, row: u32 },
+    /// Remove it.
+    Delete,
+}
+
+/// The kept log blocks folded into one list, sorted by position.
+#[derive(Debug)]
+struct DirectIndex {
+    entries: Vec<(u64, DirectSlot)>,
+    /// Whether entry `i` met its base row; an update that never did is emitted
+    /// on its own when the base is exhausted, as the record map would.
+    consumed: Vec<bool>,
+    /// The log data batches, reconciled to the merge schema.
+    data: Vec<RecordBatch>,
+    drained: bool,
+    /// Counts for the read's update statistics, as the record map keeps them.
+    stats: UpdateStats,
 }
 
 impl PositionBasedFileGroupRecordBuffer {
@@ -108,12 +178,25 @@ impl PositionBasedFileGroupRecordBuffer {
         let mut inner =
             KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
         inner.position_filter = Some(roaring::RoaringTreemap::new());
+        let direct = if direct_merge_applies(&inner, emit_delete) {
+            let budget = SpillConfig::from_config(&inner.reader_context.hoodie_reader_config)?
+                .max_in_memory_size;
+            Some(DirectMerge {
+                blocks: Vec::new(),
+                index: None,
+                bytes: 0,
+                budget,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             inner,
             base_file_instant_time,
             should_use_position: true,
             needs_hybrid_strategy: false,
             hybrid_deletes: HashMap::new(),
+            direct,
         })
     }
 
@@ -143,6 +226,327 @@ impl PositionBasedFileGroupRecordBuffer {
         match key.parse::<u64>() {
             Ok(position) => self.note_position(position),
             Err(_) => self.inner.position_filter = None,
+        }
+    }
+
+    /// Buffer a data block's records in the record map, keyed by position.
+    fn ingest_data_records(&mut self, positions: &[u64], batches: Vec<RecordBatch>) -> Result<()> {
+        let mut pos_idx = 0usize;
+        for batch in batches {
+            let batch = Arc::new(batch);
+            // `record_context` and `base.delete_context` are disjoint fields of
+            // `inner`, so these two immutable borrows coexist; the owned
+            // `records` Vec ends both borrows before the `&mut` calls below.
+            let records = self
+                .inner
+                .record_context
+                .batch_to_buffered_records(&batch, self.inner.base.delete_context.as_ref())?;
+            // Index-zip: `positions[pos_idx]` is the base-file position of the
+            // `pos_idx`-th record in file order. `decode_record_positions`
+            // returns the Roaring64 bitmap ascending, so this pairing is only
+            // correct because the Hudi writer emits records within a block in
+            // ascending base-position order, the same invariant Java's
+            // `PositionBasedFileGroupRecordBuffer` relies on with
+            // `recordPositions.get(recordIndex++)`. The caller checked that the
+            // counts agree.
+            for (_record_key, record) in records {
+                let position = positions[pos_idx];
+                pos_idx += 1;
+                self.note_position(position);
+                self.inner
+                    .process_next_data_record(record, &Self::position_key(position))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Buffer a delete block's records in the record map, keyed by position.
+    fn ingest_delete_records(
+        &mut self,
+        positions: &[u64],
+        batches: Vec<(RecordBatch, String)>,
+    ) -> Result<()> {
+        let mut pos_idx = 0usize;
+        for (batch, _inst) in batches {
+            let delete_entries = self
+                .inner
+                .record_context
+                .delete_batch_to_keys_with_ordering(&batch)?;
+            // Same ascending-order index-zip invariant as for data records.
+            for (record_key, ordering_value) in delete_entries {
+                let position = positions[pos_idx];
+                pos_idx += 1;
+                // Java sets the record key on the delete so a later fallback
+                // can re-key it; `DeleteRecord` carries it, and
+                // `process_next_deleted_record` keys the map by position.
+                let delete_record = DeleteRecord {
+                    record_key,
+                    ordering_value,
+                };
+                self.note_position(position);
+                self.inner
+                    .process_next_deleted_record(delete_record, &Self::position_key(position))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep a block for the direct merge, or buffer it in the record map when
+    /// the direct merge no longer applies. Past the merge map's budget the
+    /// kept blocks move to the record map, which can spill.
+    fn keep_or_ingest(&mut self, block: DirectBlock, bytes: usize) -> Result<()> {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.bytes += bytes;
+            direct.blocks.push(block);
+            if direct.bytes as u64 > direct.budget {
+                self.leave_direct()?;
+            }
+            return Ok(());
+        }
+        match block {
+            DirectBlock::Data { positions, batches } => {
+                self.ingest_data_records(&positions, batches)
+            }
+            DirectBlock::Delete { positions, batches } => {
+                self.ingest_delete_records(&positions, batches)
+            }
+        }
+    }
+
+    /// Stop merging directly: buffer the kept blocks in the record map, in the
+    /// order they arrived, and merge through it from here on. Only valid
+    /// before the direct merge has consumed a base batch.
+    fn leave_direct(&mut self) -> Result<()> {
+        let Some(direct) = self.direct.take() else {
+            return Ok(());
+        };
+        if direct.index.is_some() {
+            return Err(CoreError::ReadFileSliceError(
+                "internal: the direct position merge was left after it started on the base"
+                    .to_string(),
+            ));
+        }
+        for block in direct.blocks {
+            match block {
+                DirectBlock::Data { positions, batches } => {
+                    self.ingest_data_records(&positions, batches)?
+                }
+                DirectBlock::Delete { positions, batches } => {
+                    self.ingest_delete_records(&positions, batches)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold the kept blocks into the sorted position list, the first time the
+    /// base is merged. Returns `false`, after leaving the direct merge, when a
+    /// data block can't be merged directly: one that lacks a column of the
+    /// merge schema is partial in all but name.
+    fn build_direct_index(&mut self, target_schema: &SchemaRef) -> Result<bool> {
+        let Some(direct) = self.direct.as_ref() else {
+            return Ok(false);
+        };
+        if direct.index.is_some() {
+            return Ok(true);
+        }
+        let complete = direct.blocks.iter().all(|block| match block {
+            DirectBlock::Data { batches, .. } => batches.iter().all(|b| {
+                let schema = b.schema();
+                target_schema
+                    .fields()
+                    .iter()
+                    .all(|f| schema.column_with_name(f.name()).is_some())
+            }),
+            DirectBlock::Delete { .. } => true,
+        });
+        if !complete {
+            self.leave_direct()?;
+            return Ok(false);
+        }
+        let direct = self.direct.as_mut().expect("checked above");
+        let total: usize = direct
+            .blocks
+            .iter()
+            .map(|b| match b {
+                DirectBlock::Data { positions, .. } | DirectBlock::Delete { positions, .. } => {
+                    positions.len()
+                }
+            })
+            .sum();
+        let mut slots: HashMap<u64, DirectSlot> = HashMap::with_capacity(total);
+        let mut data: Vec<RecordBatch> = Vec::new();
+        for block in &direct.blocks {
+            match block {
+                DirectBlock::Data { positions, batches } => {
+                    let mut pos_idx = 0usize;
+                    for batch in batches {
+                        let deleted = built_in_delete_mask(batch);
+                        let batch_idx = data.len() as u32;
+                        data.push(reconcile_batch_to_schema(batch, target_schema)?);
+                        for row in 0..batch.num_rows() {
+                            let slot = match &deleted {
+                                Some(mask) if mask.is_valid(row) && mask.value(row) => {
+                                    DirectSlot::Delete
+                                }
+                                _ => DirectSlot::Update {
+                                    batch: batch_idx,
+                                    row: row as u32,
+                                },
+                            };
+                            slots.insert(positions[pos_idx], slot);
+                            pos_idx += 1;
+                        }
+                    }
+                }
+                DirectBlock::Delete { positions, .. } => {
+                    for &position in positions {
+                        slots.insert(position, DirectSlot::Delete);
+                    }
+                }
+            }
+        }
+        let mut entries: Vec<(u64, DirectSlot)> = slots.into_iter().collect();
+        entries.sort_unstable_by_key(|(position, _)| *position);
+        let consumed = vec![false; entries.len()];
+        direct.blocks.clear();
+        direct.index = Some(DirectIndex {
+            entries,
+            consumed,
+            data,
+            drained: false,
+            stats: UpdateStats::default(),
+        });
+        Ok(true)
+    }
+
+    /// Merge one base batch directly: mask out the rows the position list
+    /// names and append the log rows that replace them.
+    fn direct_merge(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
+        let num_rows = base.num_rows();
+        if num_rows == 0 {
+            return Ok(None);
+        }
+        let positions = base_row_position_array(base)?;
+        let index = self
+            .direct
+            .as_mut()
+            .and_then(|d| d.index.as_mut())
+            .expect("the direct index is built before the base is merged");
+        let values = positions.values();
+        let ascending = positions.null_count() == 0 && values.windows(2).all(|w| w[0] <= w[1]);
+        let (lo, hi) = match (
+            arrow::compute::min(positions),
+            arrow::compute::max(positions),
+        ) {
+            (Some(lo), Some(hi)) => (lo.max(0) as u64, hi.max(0) as u64),
+            _ => (0, 0),
+        };
+        let mut keep: Option<BooleanBufferBuilder> = None;
+        let mut picks: Vec<(usize, usize)> = Vec::new();
+        let start = index.entries.partition_point(|(p, _)| *p < lo);
+        for i in start..index.entries.len() {
+            let (position, slot) = index.entries[i];
+            if position > hi {
+                break;
+            }
+            let wanted = position as i64;
+            let row = if ascending {
+                values.binary_search(&wanted).ok()
+            } else {
+                (0..num_rows).find(|&r| positions.is_valid(r) && values[r] == wanted)
+            };
+            let Some(row) = row else {
+                continue;
+            };
+            let mask = keep.get_or_insert_with(|| {
+                let mut b = BooleanBufferBuilder::new(num_rows);
+                b.append_n(num_rows, true);
+                b
+            });
+            mask.set_bit(row, false);
+            index.consumed[i] = true;
+            match slot {
+                DirectSlot::Update { batch, row } => {
+                    index.stats.num_updates += 1;
+                    picks.push((batch as usize, row as usize));
+                }
+                DirectSlot::Delete => index.stats.num_deletes += 1,
+            }
+        }
+        let Some(mut keep) = keep else {
+            return Ok(Some(if base.schema() == *target_schema {
+                base.clone()
+            } else {
+                reconcile_batch_to_schema(base, target_schema)?
+            }));
+        };
+        let mask = BooleanArray::new(keep.finish(), None);
+        let kept = arrow::compute::filter_record_batch(base, &mask).map_err(|e| {
+            CoreError::ReadFileSliceError(format!("direct position merge: filter failed: {e}"))
+        })?;
+        let kept = reconcile_batch_to_schema(&kept, target_schema)?;
+        if picks.is_empty() {
+            return Ok(Some(kept));
+        }
+        let updates = gather(&index.data, &picks)?;
+        arrow::compute::concat_batches(target_schema, [&kept, &updates])
+            .map(Some)
+            .map_err(|e| {
+                CoreError::ReadFileSliceError(format!("direct position merge: concat failed: {e}"))
+            })
+    }
+
+    /// The updates whose base row the base read never produced, once the base
+    /// is exhausted. The record map emits such records as log-only inserts.
+    fn direct_drain(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        if self.direct.as_ref().is_some_and(|d| d.index.is_none()) {
+            self.build_direct_index(target_schema)?;
+        }
+        let Some(index) = self.direct.as_mut().and_then(|d| d.index.as_mut()) else {
+            return self.inner.drain_log_only_inserts(target_schema);
+        };
+        if index.drained {
+            return Ok(None);
+        }
+        index.drained = true;
+        let picks: Vec<(usize, usize)> = index
+            .entries
+            .iter()
+            .zip(&index.consumed)
+            .filter_map(|((_, slot), consumed)| match slot {
+                DirectSlot::Update { batch, row } if !consumed => {
+                    Some((*batch as usize, *row as usize))
+                }
+                _ => None,
+            })
+            .collect();
+        index.stats.num_inserts += picks.len() as u64;
+        if picks.is_empty() {
+            return Ok(None);
+        }
+        gather(&index.data, &picks).map(Some)
+    }
+
+    /// Log records kept for the direct merge.
+    fn direct_record_count(&self) -> usize {
+        match &self.direct {
+            Some(DirectMerge {
+                index: Some(index), ..
+            }) => index.entries.len(),
+            Some(DirectMerge { blocks, .. }) => blocks
+                .iter()
+                .map(|b| match b {
+                    DirectBlock::Data { positions, .. } | DirectBlock::Delete { positions, .. } => {
+                        positions.len()
+                    }
+                })
+                .sum(),
+            None => 0,
         }
     }
 
@@ -350,6 +754,49 @@ impl PositionBasedFileGroupRecordBuffer {
     }
 }
 
+/// Whether the direct merge can apply to this buffer at all: commit-time
+/// ordering (the newest log record wins whole), no partial-update rule, deletes
+/// marked only by delete blocks or `_hoodie_is_deleted`, and no emitted deletes.
+fn direct_merge_applies(inner: &KeyBasedFileGroupRecordBuffer, emit_delete: bool) -> bool {
+    let delete_markers_ok = inner.base.delete_context.as_ref().is_none_or(|ctx| {
+        ctx.custom_delete_marker.is_none() && ctx.hoodie_operation_pos.is_none()
+    });
+    !emit_delete
+        && inner.base.record_merge_mode == "COMMIT_TIME_ORDERING"
+        && !inner.has_partial_update_rules()
+        && delete_markers_ok
+}
+
+/// Rows of a log data batch whose `_hoodie_is_deleted` is true, if it has
+/// that column as a boolean.
+fn built_in_delete_mask(batch: &RecordBatch) -> Option<BooleanArray> {
+    batch
+        .column_by_name("_hoodie_is_deleted")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>().cloned())
+}
+
+/// Gather rows `(batch, row)` of `data` into one batch, in that order.
+fn gather(data: &[RecordBatch], picks: &[(usize, usize)]) -> Result<RecordBatch> {
+    let refs: Vec<&RecordBatch> = data.iter().collect();
+    arrow_select::interleave::interleave_record_batch(&refs, picks).map_err(|e| {
+        CoreError::ReadFileSliceError(format!("direct position merge: gather failed: {e}"))
+    })
+}
+
+/// The error for a block whose record count differs from its position count.
+fn record_count_mismatch(kind: &str, rows: usize, positions: usize) -> CoreError {
+    if rows > positions {
+        CoreError::LogBlockError(format!(
+            "position-based merge: {kind} block has more records than positions \
+             ({positions} positions for {rows} records)"
+        ))
+    } else {
+        CoreError::LogBlockError(format!(
+            "position-based merge: {kind} block record count {rows} != position count {positions}"
+        ))
+    }
+}
+
 /// Read the base row's physical position from the row-index column.
 fn position_at(base_batch: &RecordBatch, row_idx: usize) -> Result<u64> {
     let arr = base_row_position_array(base_batch)?;
@@ -377,54 +824,32 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         let positions = match self.extract_positions(block)? {
             Some(p) => p,
             None => {
+                self.leave_direct()?;
                 self.fallback_to_key_based()?;
                 return self.inner.process_data_block(block);
             }
         };
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
-            let mut pos_idx = 0usize;
-            for batch in record_batches.data_batches {
-                let batch = Arc::new(batch);
-                // `record_context` and `base.delete_context` are disjoint fields
-                // of `inner`, so these two immutable borrows coexist; the owned
-                // `records` Vec ends both borrows before the `&mut` calls below.
-                let records = self
-                    .inner
-                    .record_context
-                    .batch_to_buffered_records(&batch, self.inner.base.delete_context.as_ref())?;
-                // Index-zip: `positions[pos_idx]` is the base-file position of
-                // the `pos_idx`-th record in file order. `decode_record_positions`
-                // returns the Roaring64 bitmap ASCENDING, so this pairing is only
-                // correct because the Hudi writer emits records within a block in
-                // ascending base-position order — the same invariant Java's
-                // `PositionBasedFileGroupRecordBuffer` relies on with
-                // `recordPositions.get(recordIndex++)`.
-                for (_record_key, record) in records {
-                    let position = *positions.get(pos_idx).ok_or_else(|| {
-                        CoreError::LogBlockError(format!(
-                            "position-based merge: data block has more records than positions \
-                             ({} positions for record index {pos_idx})",
-                            positions.len(),
-                        ))
-                    })?;
-                    pos_idx += 1;
-                    self.note_position(position);
-                    self.inner
-                        .process_next_data_record(record, &Self::position_key(position))?;
-                }
+            let batches = record_batches.data_batches;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if rows != positions.len() {
+                return Err(record_count_mismatch("data", rows, positions.len()));
             }
-            if pos_idx != positions.len() {
-                return Err(CoreError::LogBlockError(format!(
-                    "position-based merge: data block record count {pos_idx} != position count {}",
-                    positions.len(),
-                )));
+            let partial = batches
+                .iter()
+                .any(|b| b.schema().metadata().contains_key(PARTIAL_UPDATE_SCHEMA_KEY));
+            if partial {
+                self.leave_direct()?;
             }
+            let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            self.keep_or_ingest(DirectBlock::Data { positions, batches }, bytes)?;
         }
         Ok(())
     }
 
     fn process_next_data_record(&mut self, record: BufferedRecord, key: &str) -> Result<()> {
+        self.leave_direct()?;
         self.note_position_key(key);
         self.inner.process_next_data_record(record, key)
     }
@@ -436,49 +861,20 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         let positions = match self.extract_positions(block)? {
             Some(p) => p,
             None => {
+                self.leave_direct()?;
                 self.fallback_to_key_based()?;
                 return self.inner.process_delete_block(block);
             }
         };
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
-            let mut pos_idx = 0usize;
-            for (batch, _inst) in record_batches.delete_batches {
-                let delete_entries = self
-                    .inner
-                    .record_context
-                    .delete_batch_to_keys_with_ordering(&batch)?;
-                // Same ascending-order index-zip invariant as in
-                // `process_data_block` above.
-                for (record_key, ordering_value) in delete_entries {
-                    let position = *positions.get(pos_idx).ok_or_else(|| {
-                        CoreError::LogBlockError(format!(
-                            "position-based merge: delete block has more records than positions \
-                             ({} positions for record index {pos_idx})",
-                            positions.len(),
-                        ))
-                    })?;
-                    pos_idx += 1;
-                    // Java sets the record key on the delete so a later fallback
-                    // can re-key it; `DeleteRecord` carries it, and
-                    // `process_next_deleted_record` keys the map by position.
-                    let delete_record = DeleteRecord {
-                        record_key,
-                        ordering_value,
-                    };
-                    self.note_position(position);
-                    self.inner.process_next_deleted_record(
-                        delete_record,
-                        &Self::position_key(position),
-                    )?;
-                }
+            let batches = record_batches.delete_batches;
+            let rows: usize = batches.iter().map(|(b, _)| b.num_rows()).sum();
+            if rows != positions.len() {
+                return Err(record_count_mismatch("delete", rows, positions.len()));
             }
-            if pos_idx != positions.len() {
-                return Err(CoreError::LogBlockError(format!(
-                    "position-based merge: delete block record count {pos_idx} != position count {}",
-                    positions.len(),
-                )));
-            }
+            let bytes: usize = batches.iter().map(|(b, _)| b.get_array_memory_size()).sum();
+            self.keep_or_ingest(DirectBlock::Delete { positions, batches }, bytes)?;
         }
         Ok(())
     }
@@ -488,6 +884,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         delete_record: DeleteRecord,
         key: &str,
     ) -> Result<()> {
+        self.leave_direct()?;
         self.note_position_key(key);
         self.inner.process_next_deleted_record(delete_record, key)
     }
@@ -498,6 +895,11 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     /// in-memory tier is scanned; a spilled position entry is not visible here
     /// (a limitation shared with the key-based `get_log_records`).
     fn contains_log_record(&self, record_key: &str) -> bool {
+        if self.direct.is_some() {
+            // Kept blocks hold records by position; a record key is not indexed
+            // until they reach the record map.
+            return false;
+        }
         if !self.should_use_position {
             return self.inner.contains_log_record(record_key);
         }
@@ -510,11 +912,11 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn size(&self) -> usize {
-        self.inner.size()
+        self.inner.size() + self.direct_record_count()
     }
 
     fn get_total_log_records(&self) -> u64 {
-        self.inner.get_total_log_records()
+        self.inner.get_total_log_records() + self.direct_record_count() as u64
     }
 
     fn merge_map_peak_entries(&self) -> u64 {
@@ -534,7 +936,13 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn update_stats_snapshot(&self) -> UpdateStats {
-        self.inner.update_stats_snapshot()
+        let mut stats = self.inner.update_stats_snapshot();
+        if let Some(index) = self.direct.as_ref().and_then(|d| d.index.as_ref()) {
+            stats.num_inserts += index.stats.num_inserts;
+            stats.num_updates += index.stats.num_updates;
+            stats.num_deletes += index.stats.num_deletes;
+        }
+        stats
     }
 
     fn get_log_records(&self) -> &crate::file_group::reader_v2::buffer::MergeMap {
@@ -554,6 +962,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn has_next(&mut self) -> Result<bool> {
+        self.leave_direct()?;
         if self.inner.base.next_record.is_some() {
             return Ok(true);
         }
@@ -565,6 +974,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn merge_and_collect_with_stats(mut self: Box<Self>) -> Result<(RecordBatch, UpdateStats)> {
+        self.leave_direct()?;
         // Output schema selection mirrors the key-based buffer.
         let schema = if let Some(schema) = &self.inner.base.reader_schema {
             schema.clone()
@@ -600,6 +1010,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        self.leave_direct()?;
         if self.needs_hybrid_strategy {
             return self.next_hybrid_base_batch(target_schema);
         }
@@ -628,12 +1039,18 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                     .to_string(),
             ));
         }
+        if self.should_use_position && self.build_direct_index(target_schema)? {
+            return self.direct_merge(base, target_schema);
+        }
         let base_match = self.base_match();
         self.inner
             .merge_one_base_batch_kernel(base, target_schema, base_match)
     }
 
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        if self.direct.is_some() {
+            return self.direct_drain(target_schema);
+        }
         self.inner.drain_log_only_inserts(target_schema)
     }
 }
@@ -644,6 +1061,7 @@ mod tests {
     use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader_v2::buffer::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME;
+    use crate::file_group::reader_v2::buffer::spillable_map::CONFIG_MERGE_MAX_SIZE;
     use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
     use arrow_array::{Int32Array, Int64Array, StringArray};
@@ -1061,37 +1479,71 @@ mod tests {
         );
     }
 
-    /// Base rows whose positions have no log record skip the merge-map lookup:
-    /// a batch with none of them is returned whole, and inside a batch with
-    /// some, only those rows are looked up. The result must equal the merge
-    /// that looks every row up.
+    /// How a merge test drives the buffer.
+    #[derive(Clone, Copy, Debug)]
+    enum MergeWay {
+        /// The direct position merge over the kept blocks.
+        Direct,
+        /// The record map keyed by position, with the position filter.
+        PositionMap,
+        /// The record map keyed by record key.
+        RecordKey,
+    }
+
+    /// Update and delete blocks across two commits, merged over a base of two
+    /// batches. The direct merge must return what both record-map merges do:
+    /// a later block wins at a position, a delete removes the row, and a base
+    /// batch no block touches comes back whole.
     #[test]
-    fn position_filter_skips_untouched_rows_and_batches() {
-        fn run(use_filter: bool) -> Vec<(String, i32, i64)> {
+    fn direct_merge_matches_position_and_key_merges() {
+        fn run(way: MergeWay) -> Vec<(String, i32, i64)> {
             let mut buffer = build_buffer();
-            // Update positions 2 and 7, delete position 5. Positions 10..15
-            // (the second batch) are untouched.
-            let mut block =
-                data_block_with_positions(&[("k2", 200, 9), ("k7", 700, 9)], &[2, 7], BASE_INSTANT);
-            buffer.process_data_block(&mut block).unwrap();
-            let mut delete = delete_block_with_positions(&["k5"], &[5], BASE_INSTANT);
-            buffer.process_delete_block(&mut delete).unwrap();
-            if use_filter {
-                let filter = buffer.inner.position_filter.as_ref().unwrap();
-                assert_eq!(filter.iter().collect::<Vec<_>>(), vec![2, 5, 7]);
-            } else {
-                buffer.inner.position_filter = None;
+            if matches!(way, MergeWay::RecordKey) {
+                buffer.direct = None;
+                buffer.fallback_to_key_based().unwrap();
             }
-            let keys: Vec<String> = (0..15).map(|i| format!("k{i}")).collect();
+            // Commit 1 updates positions 2 and 7 and deletes position 5.
+            let mut update1 = data_block_with_positions_at_instant(
+                &[("k2", 200, 9), ("k7", 700, 9)],
+                &[2, 7],
+                BASE_INSTANT,
+                "20240101000001000",
+            );
+            buffer.process_data_block(&mut update1).unwrap();
+            let mut delete1 = delete_block_with_positions(&["k5"], &[5], BASE_INSTANT);
+            buffer.process_delete_block(&mut delete1).unwrap();
+            // Commit 2 updates position 7 again, deletes position 2 and
+            // updates position 12, in the second base batch.
+            let mut update2 = data_block_with_positions_at_instant(
+                &[("k7", 777, 9), ("k12", 1200, 9)],
+                &[7, 12],
+                BASE_INSTANT,
+                "20240101000002000",
+            );
+            buffer.process_data_block(&mut update2).unwrap();
+            let mut delete2 = delete_block_with_positions(&["k2"], &[2], BASE_INSTANT);
+            buffer.process_delete_block(&mut delete2).unwrap();
+            match way {
+                MergeWay::Direct => assert!(buffer.direct.is_some()),
+                MergeWay::PositionMap => {
+                    buffer.leave_direct().unwrap();
+                    let filter = buffer.inner.position_filter.as_ref().unwrap();
+                    assert_eq!(filter.iter().collect::<Vec<_>>(), vec![2, 5, 7, 12]);
+                }
+                MergeWay::RecordKey => {
+                    assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge)
+                }
+            }
+            let keys: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
             let rows: Vec<(&str, i32, i64)> = keys
                 .iter()
                 .enumerate()
                 .map(|(i, k)| (k.as_str(), i as i32, 1))
                 .collect();
-            let (first, second) = rows.split_at(10);
             let target = schema();
             let mut all: Vec<RecordBatch> = Vec::new();
-            for batch in [base_batch_at(first, 0), base_batch_at(second, 10)] {
+            for (range, start) in [(0..10, 0u64), (10..15, 10), (15..20, 15)] {
+                let batch = base_batch_at(&rows[range], start);
                 if let Some(out) = buffer.merge_base_batch(&batch, &target).unwrap() {
                     all.push(out);
                 }
@@ -1100,16 +1552,50 @@ mod tests {
                 all.push(b);
             }
             let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
-            let mut rows = extract(&merged);
-            rows.sort();
-            rows
+            let mut out = extract(&merged);
+            out.sort();
+            out
         }
-        let filtered = run(true);
-        assert_eq!(filtered, run(false));
-        assert_eq!(filtered.len(), 14, "one of 15 base rows is deleted");
-        assert!(filtered.contains(&("k2".to_string(), 200, 9)));
-        assert!(filtered.contains(&("k7".to_string(), 700, 9)));
-        assert!(!filtered.iter().any(|(k, _, _)| k == "k5"));
+        let direct = run(MergeWay::Direct);
+        assert_eq!(direct, run(MergeWay::PositionMap));
+        assert_eq!(direct, run(MergeWay::RecordKey));
+        assert_eq!(direct.len(), 18, "positions 2 and 5 are deleted");
+        assert!(direct.contains(&("k7".to_string(), 777, 9)), "the later update wins");
+        assert!(direct.contains(&("k12".to_string(), 1200, 9)));
+        assert!(!direct.iter().any(|(k, _, _)| k == "k2" || k == "k5"));
+    }
+
+    /// An update whose base row the base read never produces is emitted once
+    /// the base is exhausted, and a block that would outgrow the merge map's
+    /// budget hands the kept blocks to the map.
+    #[test]
+    fn direct_merge_drains_unmatched_updates_and_respects_budget() {
+        let mut buffer = build_buffer();
+        let mut block =
+            data_block_with_positions(&[("k1", 100, 9), ("k40", 4000, 9)], &[1, 40], BASE_INSTANT);
+        buffer.process_data_block(&mut block).unwrap();
+        let target = schema();
+        let base = base_batch_at(&[("k0", 0, 1), ("k1", 1, 1), ("k2", 2, 1)], 0);
+        let merged = buffer.merge_base_batch(&base, &target).unwrap().unwrap();
+        let mut rows = extract(&merged);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("k0".to_string(), 0, 1),
+                ("k1".to_string(), 100, 9),
+                ("k2".to_string(), 2, 1)
+            ]
+        );
+        let drained = buffer.drain_log_only_inserts(&target).unwrap().unwrap();
+        assert_eq!(extract(&drained), vec![("k40".to_string(), 4000, 9)]);
+        assert!(buffer.drain_log_only_inserts(&target).unwrap().is_none());
+
+        let mut tiny = build_buffer_with_reader_config(&[(CONFIG_MERGE_MAX_SIZE, "1")]);
+        let mut block = data_block_with_positions(&[("k1", 100, 9)], &[1], BASE_INSTANT);
+        tiny.process_data_block(&mut block).unwrap();
+        assert!(tiny.direct.is_none(), "past the budget the blocks go to the map");
+        assert_eq!(tiny.size(), 1);
     }
 
     /// Two data blocks from consecutive commits both target the SAME base
