@@ -50,6 +50,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 struct Counting;
 
 static COUNT_ON: AtomicBool = AtomicBool::new(false);
+static LAYOUT_PRINTED: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -246,6 +247,31 @@ async fn run_parquet(args: &Args, slices: &[Slice]) -> (u64, usize) {
                     .iter()
                     .map(|c| builder.schema().index_of(c).expect("column"))
                     .collect();
+                if !LAYOUT_PRINTED.swap(true, Ordering::Relaxed) {
+                    let md = builder.metadata();
+                    let rg = md.row_groups();
+                    eprintln!(
+                        "LAYOUT file={} row_groups={} rows={} created_by={:?}",
+                        s.base,
+                        rg.len(),
+                        md.file_metadata().num_rows(),
+                        md.file_metadata().created_by()
+                    );
+                    if let Some(first) = rg.first() {
+                        for c in first.columns() {
+                            eprintln!(
+                                "LAYOUT col={} physical={:?} logical={:?} codec={:?} encodings={:?} compressed={} uncompressed={}",
+                                c.column_path(),
+                                c.column_type(),
+                                c.column_descr().logical_type_ref(),
+                                c.compression(),
+                                c.encodings().collect::<Vec<_>>(),
+                                c.compressed_size(),
+                                c.uncompressed_size()
+                            );
+                        }
+                    }
+                }
                 let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
                 let mut stream = builder
                     .with_projection(mask)
