@@ -39,6 +39,7 @@ use std::time::Instant;
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use hudi_core::config::read_options::ReadOptions;
+use hudi_core::file_group::reader::FileGroupReader;
 use hudi_core::table::builder::TableBuilder;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
@@ -161,7 +162,9 @@ fn slices(table: &str, partitions: &[String]) -> Vec<Slice> {
     out
 }
 
-async fn run_hudi(args: &Args, slices: &[Slice], with_logs: bool) -> (u64, usize) {
+/// Opens the table and its reader once, as the native scan's executor-wide cache
+/// does, so the timed reads below measure reading rather than table opens.
+async fn open_reader(args: &Args) -> (Arc<FileGroupReader>, ReadOptions) {
     let mut opts: Vec<(String, String)> = Vec::new();
     for kv in &args.hudi_opt {
         let (k, v) = kv.split_once('=').expect("k=v");
@@ -186,6 +189,16 @@ async fn run_hudi(args: &Args, slices: &[Slice], with_logs: bool) -> (u64, usize
             .await
             .expect("reader"),
     );
+    (reader, read_options)
+}
+
+async fn run_hudi(
+    reader: &Arc<FileGroupReader>,
+    read_options: &ReadOptions,
+    concurrency: usize,
+    slices: &[Slice],
+    with_logs: bool,
+) -> (u64, usize) {
     let results: Vec<(u64, usize)> = futures::stream::iter(slices.iter().cloned())
         .map(|s| {
             let reader = reader.clone();
@@ -210,7 +223,7 @@ async fn run_hudi(args: &Args, slices: &[Slice], with_logs: bool) -> (u64, usize
                 (rows, batches)
             }
         })
-        .buffer_unordered(args.concurrency)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
     results
@@ -377,13 +390,20 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    let hudi = if args.mode.starts_with("hudi") {
+        Some(runtime.block_on(open_reader(&args)))
+    } else {
+        None
+    };
     let run_once = || {
         runtime.block_on(async {
-            match args.mode.as_str() {
-                "hudi" => run_hudi(&args, &slices, true).await,
-                "hudi-base" => run_hudi(&args, &slices, false).await,
-                "parquet" => run_parquet(&args, &slices).await,
-                m => panic!("unknown mode {m}"),
+            match (args.mode.as_str(), &hudi) {
+                ("hudi", Some((r, o))) => run_hudi(r, o, args.concurrency, &slices, true).await,
+                ("hudi-base", Some((r, o))) => {
+                    run_hudi(r, o, args.concurrency, &slices, false).await
+                }
+                ("parquet", _) => run_parquet(&args, &slices).await,
+                (m, _) => panic!("unknown mode {m}"),
             }
         })
     };
