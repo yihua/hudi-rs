@@ -725,7 +725,15 @@ impl KeyBasedFileGroupRecordBuffer {
                                 }
                                 None => false,
                             };
-                            let rec = match log_rec.get_record().filter(|_| is_partial) {
+                            // Only a partial record is read as a row here; slicing a
+                            // full one out of its block batch would cost one `Arc`
+                            // clone per column for every winning log record.
+                            let partial_row = if is_partial {
+                                log_rec.get_record()
+                            } else {
+                                None
+                            };
+                            let rec = match partial_row {
                                 Some(lb) => {
                                     let merged = overlay_partial_over_prior(
                                         &lb,
