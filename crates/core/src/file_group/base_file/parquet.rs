@@ -37,7 +37,7 @@ use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arrow_schema};
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 
-use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream, ChooseReadOptions};
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
 use crate::storage::ReadVolume;
@@ -623,9 +623,87 @@ impl ParquetBaseFileReader {
         relative_path: &str,
         row_index_column: Option<&str>,
     ) -> Result<(CountedBuilder, ReadPlanCell)> {
-        let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
+        self.open_builder_knowing(relative_path, row_index_column, None)
+            .await
+    }
+
+    /// [`Self::open_builder`], skipping the size lookup when the caller already
+    /// has it. The listing that produced the file slice recorded the size, so
+    /// asking the store again is a metadata round trip for nothing.
+    async fn open_builder_knowing(
+        &self,
+        relative_path: &str,
+        row_index_column: Option<&str>,
+        known_file_size: Option<u64>,
+    ) -> Result<(CountedBuilder, ReadPlanCell)> {
+        let (obj_path, file_size) = match known_file_size {
+            Some(size) => {
+                let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+                (ObjPath::from_url_path(obj_url.path())?, size)
+            }
+            None => self.object_path_and_size(relative_path).await?,
+        };
         self.open_builder_with_size(obj_path, file_size, row_index_column)
             .await
+    }
+
+    /// The schema the stream built from this footer will yield, less the
+    /// virtual row-position column, which is the reader's and not the file's.
+    ///
+    /// The arrow reader's schema rather than a bare parquet-to-arrow
+    /// conversion: the two differ on a file with an embedded Arrow schema, and
+    /// a caller comparing this against a table schema to decide whether each
+    /// batch needs reconciling must see the types the batches will carry.
+    fn file_schema(
+        builder: &CountedBuilder,
+        row_index_column: Option<&str>,
+    ) -> arrow_schema::SchemaRef {
+        let schema = builder.schema();
+        let Some(name) = row_index_column else {
+            return schema.clone();
+        };
+        let fields: Vec<arrow_schema::FieldRef> = schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != name)
+            .cloned()
+            .collect();
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    }
+
+    /// Build the stream from an open builder; shared by both stream entry points
+    /// so they cannot wire the row-position column or the volume counters
+    /// differently.
+    fn stream_from_builder(
+        &self,
+        builder: CountedBuilder,
+        plan: &ReadPlanCell,
+        options: &BaseFileReadOptions,
+    ) -> Result<BaseFileStream> {
+        let builder = self.apply_options(builder, options, plan)?;
+        let full_schema = builder.schema().clone();
+        let stream = builder.build()?;
+        let schema = Self::schema_with_row_index(
+            stream.schema(),
+            &full_schema,
+            options.row_index_column.as_deref(),
+        )?;
+        // Rows the stream actually yields — after any row filter. Against
+        // `file_rows` this is the read's selectivity; against `bytes_read`,
+        // what that selectivity cost.
+        let volume = self.storage.read_volume.clone();
+        let mapped_stream = stream
+            .map(move |result| {
+                let batch = result.map_err(StorageError::from)?;
+                volume.add_rows_out(batch.num_rows() as u64);
+                Ok(batch)
+            })
+            .boxed();
+
+        Ok(BaseFileStream::new(schema, mapped_stream))
     }
 
     fn apply_options(
@@ -790,29 +868,39 @@ impl BaseFileReader for ParquetBaseFileReader {
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
             let (builder, plan) = self
-                .open_builder(relative_path, options.row_index_column.as_deref())
+                .open_builder_knowing(
+                    relative_path,
+                    options.row_index_column.as_deref(),
+                    options.known_file_size,
+                )
                 .await?;
-            let builder = self.apply_options(builder, &options, &plan)?;
-            let full_schema = builder.schema().clone();
-            let stream = builder.build()?;
-            let schema = Self::schema_with_row_index(
-                stream.schema(),
-                &full_schema,
-                options.row_index_column.as_deref(),
-            )?;
-            // Rows the stream actually yields — after any row filter. Against
-            // `file_rows` this is the read's selectivity; against `bytes_read`,
-            // what that selectivity cost.
-            let volume = self.storage.read_volume.clone();
-            let mapped_stream = stream
-                .map(move |result| {
-                    let batch = result.map_err(StorageError::from)?;
-                    volume.add_rows_out(batch.num_rows() as u64);
-                    Ok(batch)
-                })
-                .boxed();
+            self.stream_from_builder(builder, &plan, &options)
+        })
+    }
 
-            Ok(BaseFileStream::new(schema, mapped_stream))
+    /// One footer fetch serves both the schema the caller chooses by and the
+    /// stream it then reads.
+    fn read_stream_with_schema<'a>(
+        &'a self,
+        relative_path: &'a str,
+        open_options: BaseFileReadOptions,
+        choose: ChooseReadOptions<'a>,
+    ) -> BoxFuture<'a, Result<BaseFileStream>> {
+        Box::pin(async move {
+            let (builder, plan) = self
+                .open_builder_knowing(
+                    relative_path,
+                    open_options.row_index_column.as_deref(),
+                    open_options.known_file_size,
+                )
+                .await?;
+            let file_schema = Self::file_schema(&builder, open_options.row_index_column.as_deref());
+            let mut options = choose(&file_schema)?;
+            // The open already honoured these; the chosen options cannot change
+            // how the file was opened, only what is read from it.
+            options.row_index_column = open_options.row_index_column;
+            options.known_file_size = open_options.known_file_size;
+            self.stream_from_builder(builder, &plan, &options)
         })
     }
 
