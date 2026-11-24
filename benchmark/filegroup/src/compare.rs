@@ -327,7 +327,11 @@ fn print_profile(report: &pprof::Report, top: usize) {
     println!("PROFILE samples={total}");
     println!("PROFILE top self:");
     for (n, c) in s.iter().take(top) {
-        println!("PROFILE self {:5.1}% {}", 100.0 * *c as f64 / total as f64, n);
+        println!(
+            "PROFILE self {:5.1}% {}",
+            100.0 * *c as f64 / total as f64,
+            n
+        );
     }
     let mut i: Vec<_> = incl.into_iter().collect();
     i.sort_by(|a, b| b.1.cmp(&a.1));
@@ -337,7 +341,11 @@ fn print_profile(report: &pprof::Report, top: usize) {
         .filter(|(n, _)| !BORING.iter().any(|b| n.contains(b)))
         .take(top * 2)
     {
-        println!("PROFILE incl {:5.1}% {}", 100.0 * *c as f64 / total as f64, n);
+        println!(
+            "PROFILE incl {:5.1}% {}",
+            100.0 * *c as f64 / total as f64,
+            n
+        );
     }
     // Stacks, leaf first, cut to the first few frames that name a function of
     // interest, so a hot leaf (an atomic add, a memcpy) shows who called it.
@@ -356,7 +364,11 @@ fn print_profile(report: &pprof::Report, top: usize) {
     st.sort_by(|a, b| b.1.cmp(&a.1));
     println!("PROFILE top stacks:");
     for (n, c) in st.iter().take(top + 15) {
-        println!("PROFILE stack {:5.1}% {}", 100.0 * *c as f64 / total as f64, n);
+        println!(
+            "PROFILE stack {:5.1}% {}",
+            100.0 * *c as f64 / total as f64,
+            n
+        );
     }
 }
 
