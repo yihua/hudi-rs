@@ -4884,9 +4884,10 @@ async fn test_merge_on_read_projection_without_custom_delete_marker_column() {
     };
     let expected = vec![("b".to_string(), 20), ("c".to_string(), 3)];
     let full = table
-        .read(&with_marker(
-            ReadOptions::new().with_hudi_option("hoodie.read.file.group.reader.version", "2"),
-        ))
+        .read(&with_marker(ReadOptions::new().with_hudi_option(
+            "hoodie.read.file.group.reader.version",
+            "2",
+        )))
         .await
         .unwrap();
     assert_eq!(rows_by_id(&full), expected);
