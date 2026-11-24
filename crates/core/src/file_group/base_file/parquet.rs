@@ -540,10 +540,12 @@ where
 /// Bytes fetched from the end of a file for its footer in one request.
 ///
 /// Without a hint the reader asks for the 8-byte footer length first and then
-/// for the footer, two round trips per file. 512 KiB holds the footer of a
-/// typical base file, and a larger one costs one more request than it did
-/// before, not more.
-const FOOTER_SIZE_HINT: usize = 512 * 1024;
+/// for the footer, two round trips per file. A Hudi base file's footer carries
+/// the record-key bloom filter as a key-value entry, which alone is about 860 KB
+/// at the writer's default 60,000 entries and grows with the configured count,
+/// so 1.5 MiB serves such a footer in one request with room to spare. A larger
+/// footer costs one more request, as it would without the hint.
+const FOOTER_SIZE_HINT: usize = 1536 * 1024;
 
 /// The builder every read here is driven from: a parquet object reader that
 /// splits large reads, with the read-volume counters and the row-group prefetch
@@ -2338,5 +2340,71 @@ mod tests {
             assert_eq!(volume.io_calls.load(Ordering::Relaxed), 1);
             assert_eq!(volume.bytes_read.load(Ordering::Relaxed), 1000);
         }
+    }
+
+    /// A footer holding a Hudi-sized bloom filter still arrives in one request:
+    /// with the size known, the read sends no metadata lookup and one footer
+    /// fetch, so every other request is a column chunk.
+    #[tokio::test]
+    async fn test_a_large_bloom_filter_footer_is_fetched_in_one_request() {
+        use crate::storage::counting::CountingObjectStore;
+        use arrow_array::{Int64Array, RecordBatch};
+        #[allow(unused_imports)]
+        use object_store::ObjectStore;
+        use object_store::PutPayload;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+        // The size of the filter a Hudi writer stores at its default 60,000
+        // entries and a 1e-9 false-positive rate.
+        let bloom = KeyValue::new("org.apache.hudi.bloomfilter".to_string(), "A".repeat(862_724));
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![bloom]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = bytes.len() as u64;
+        assert!(file_size > 862_724, "the footer must carry the filter");
+
+        let memory = object_store::memory::InMemory::new();
+        memory
+            .put(&ObjPath::from("table/bloom.parquet"), PutPayload::from(bytes))
+            .await
+            .unwrap();
+        let (store, counts) = CountingObjectStore::new(Arc::new(memory));
+        let storage = Storage::new_with_object_store(
+            Url::parse("memory:///table/").unwrap(),
+            store,
+            Arc::new(crate::config::HudiConfigs::empty()),
+        );
+
+        let read = ParquetBaseFileReader::new(storage)
+            .read_data(
+                "bloom.parquet",
+                BaseFileReadOptions::default().with_known_file_size(file_size),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.num_rows(), 1000);
+        assert_eq!(counts.heads(), 0, "a known size needs no metadata lookup");
+        assert_eq!(
+            counts.gets(),
+            2,
+            "one footer fetch and one column chunk, got {} gets",
+            counts.gets()
+        );
     }
 }
