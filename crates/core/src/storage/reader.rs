@@ -17,6 +17,7 @@
  * under the License.
  */
 use crate::config::HudiConfigs;
+use crate::storage::ReadVolume;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
@@ -162,6 +163,8 @@ pub struct LogBlockFetcher {
     /// What this fetcher has actually read, shared across clones so a caller
     /// holding one clone can account for reads made through another.
     reads: Arc<FetchCounts>,
+    /// Where its reads are also counted as log bytes, when it reads a log file.
+    volume: Option<Arc<ReadVolume>>,
 }
 
 /// What a fetcher read, as opposed to what it was asked for.
@@ -216,6 +219,7 @@ impl LogBlockFetcher {
             object_store,
             location,
             reads: Arc::new(FetchCounts::default()),
+            volume: None,
         }
     }
 
@@ -228,6 +232,9 @@ impl LogBlockFetcher {
     pub async fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
         let bytes = get_range(&self.object_store, &self.location, offset, length).await?;
         self.reads.record(1, bytes.len() as u64);
+        if let Some(volume) = &self.volume {
+            volume.add_log_bytes(1, bytes.len() as u64);
+        }
         Ok(bytes)
     }
 
@@ -257,8 +264,11 @@ impl LogBlockFetcher {
             })?;
         // One call, whatever coalescing and fan-out did underneath, and the
         // bytes it handed back. Counting `ranges.len()` would count the plan.
-        self.reads
-            .record(1, fetched.iter().map(|b| b.len() as u64).sum());
+        let bytes = fetched.iter().map(|b| b.len() as u64).sum();
+        self.reads.record(1, bytes);
+        if let Some(volume) = &self.volume {
+            volume.add_log_bytes(1, bytes);
+        }
         Ok(fetched)
     }
 }
@@ -290,6 +300,10 @@ pub struct StorageReader {
     window_start: u64,
     /// How much to fetch per window refill. See [`stream_window_size`].
     window_size: u64,
+    /// Where fetches are counted as log bytes; see [`Self::count_log_reads`].
+    volume: Option<Arc<ReadVolume>>,
+    /// Calls and bytes fetched before a volume was attached: the open's own.
+    opened: (u64, u64),
 }
 
 impl StorageReader {
@@ -313,6 +327,8 @@ impl StorageReader {
             window: Bytes::new(),
             window_start: 0,
             window_size: DEFAULT_STREAM_WINDOW_SIZE,
+            volume: None,
+            opened: (1, file_len),
         })
     }
 
@@ -336,6 +352,8 @@ impl StorageReader {
             window: Bytes::new(),
             window_start: 0,
             window_size,
+            volume: None,
+            opened: (0, 0),
         }
     }
 
@@ -349,14 +367,31 @@ impl StorageReader {
         window: Bytes,
     ) -> Self {
         let mut reader = Self::new_streaming(object_store, object_meta, window_size);
+        reader.opened = (1, window.len() as u64);
         reader.window = window;
         reader
+    }
+
+    /// Count this reader's fetches, and those of its block fetchers, as log
+    /// bytes in `volume`, including what opening it already fetched.
+    pub(crate) fn count_log_reads(&mut self, volume: Arc<ReadVolume>) {
+        let (calls, bytes) = std::mem::take(&mut self.opened);
+        volume.add_log_bytes(calls, bytes);
+        self.volume = Some(volume);
+    }
+
+    fn record_fetch(&self, bytes: u64) {
+        if let Some(volume) = &self.volume {
+            volume.add_log_bytes(1, bytes);
+        }
     }
 
     /// A fetcher over the same file, for reading a block's content later
     /// without re-opening it.
     pub fn block_fetcher(&self) -> LogBlockFetcher {
-        LogBlockFetcher::new(self.object_store.clone(), self.location.clone())
+        let mut fetcher = LogBlockFetcher::new(self.object_store.clone(), self.location.clone());
+        fetcher.volume = self.volume.clone();
+        fetcher
     }
 
     /// Length of the whole file, known without reading any of it.
@@ -400,6 +435,7 @@ impl StorageReader {
         let end = self.pos.saturating_add(self.window_size).min(self.file_len);
         self.window =
             get_range(&self.object_store, &self.location, self.pos, end - self.pos).await?;
+        self.record_fetch(self.window.len() as u64);
         self.window_start = self.pos;
         Ok(())
     }
@@ -444,6 +480,7 @@ impl StorageReader {
         // tuned for sweeping headers, and it has to be contiguous to decode.
         if len > self.window_size {
             let bytes = get_range(&self.object_store, &self.location, self.pos, len).await?;
+            self.record_fetch(bytes.len() as u64);
             self.pos = end;
             return Ok(bytes);
         }
