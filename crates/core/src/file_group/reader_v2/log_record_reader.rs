@@ -531,12 +531,13 @@ impl BaseHoodieLogRecordReader {
             // content held from the walk within one window in total.
             let paths = self.log_file_paths.clone();
             let per_file_budget = resident_budget / (paths.len().max(1) as u64);
-            let walks = paths.iter().map(|path| {
+            let storage = self.storage.clone();
+            let walks = paths.into_iter().map(|path: String| {
                 let hudi_configs = hudi_configs.clone();
-                let storage = self.storage.clone();
+                let storage = storage.clone();
                 async move {
                     let mut reader =
-                        LogFileReader::new_streaming(hudi_configs, storage, path).await?;
+                        LogFileReader::new_streaming(hudi_configs, storage, &path).await?;
                     let mut budget = per_file_budget;
                     let blocks = reader.read_all_blocks_metadata_only(&mut budget).await?;
                     // A file inside one fetch window costs a single request whose
