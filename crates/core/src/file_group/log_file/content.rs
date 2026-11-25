@@ -35,6 +35,7 @@ use crate::storage::RowFilterBuilder;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -374,7 +375,7 @@ impl Decoder {
                 .and_then(|batches| mark_partial_update(batches, header))
                 .map(LogBlockContent::Records),
             BlockType::ParquetData => self
-                .decode_parquet_record_content(reader)
+                .decode_parquet_record_content(reader, header)
                 .and_then(|batches| mark_partial_update(batches, header))
                 .map(LogBlockContent::Records),
             BlockType::Delete => self
@@ -644,7 +645,11 @@ impl Decoder {
         Ok(batches)
     }
 
-    fn decode_parquet_record_content(&self, mut reader: impl Read) -> Result<RecordBatches> {
+    fn decode_parquet_record_content(
+        &self,
+        mut reader: impl Read,
+        header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<RecordBatches> {
         let mut content_bytes = Vec::new();
         reader.read_to_end(&mut content_bytes)?;
         let content_bytes = Bytes::from(content_bytes);
@@ -690,6 +695,27 @@ impl Decoder {
         };
         if let Some(row_filter) = row_filter {
             builder = builder.with_row_filter(row_filter);
+        }
+        // Decoded to the projection, as a full Avro block is narrowed to it: a
+        // parquet block's columns are stored apart, so the others are never
+        // decompressed or decoded. A partial-update block is still read whole,
+        // since the merge tells its written columns from the rest by what it
+        // carries, and so is any block when a reader schema is set.
+        if let (None, Some(columns)) = (&self.reader_schema_json, &self.projection)
+            && !is_partial_update_block(header)
+        {
+            let root = builder.parquet_schema().root_schema();
+            let keep: Vec<usize> = root
+                .get_fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| columns.iter().any(|c| c == field.name()))
+                .map(|(i, _)| i)
+                .collect();
+            if keep.len() < root.get_fields().len() {
+                let mask = ProjectionMask::roots(builder.parquet_schema(), keep);
+                builder = builder.with_projection(mask);
+            }
         }
         let parquet_reader = builder.build()?;
         let mut batches = RecordBatches::new();
@@ -1658,7 +1684,7 @@ mod tests {
             include_bytes!("../../../tests/data/i3/legacy_2level_repeated_map.parquet");
 
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
-        let batches = decoder.decode_parquet_record_content(LEGACY_2LEVEL)?;
+        let batches = decoder.decode_parquet_record_content(LEGACY_2LEVEL, &HashMap::new())?;
 
         assert!(
             batches.num_data_rows() > 0,
@@ -1693,11 +1719,29 @@ mod tests {
         let hudi_configs = HudiConfigs::empty();
         let decoder = Decoder::new(Arc::new(hudi_configs));
         let bytes = Bytes::from(buf);
-        let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes));
+        let mut reader = BufReader::with_capacity(bytes.len(), Cursor::new(bytes.clone()));
 
-        let batches = decoder.decode_parquet_record_content(&mut reader)?;
+        let batches = decoder.decode_parquet_record_content(&mut reader, &HashMap::new())?;
         assert_eq!(batches.num_data_batches(), 1);
         assert_eq!(batches.num_data_rows(), 3);
+
+        // With a projection, only its columns are decoded, unless the block is
+        // a partial update, which is read whole.
+        let projected = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_projection(Some(Arc::new(vec!["name".to_string()])));
+        let only_name =
+            projected.decode_parquet_record_content(Cursor::new(bytes.clone()), &HashMap::new())?;
+        let names: Vec<String> = only_name.data_batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["name".to_string()]);
+        assert_eq!(only_name.num_data_rows(), 3);
+        let partial = HashMap::from([(BlockMetadataKey::IsPartial, "true".to_string())]);
+        let whole = projected.decode_parquet_record_content(Cursor::new(bytes), &partial)?;
+        assert_eq!(whole.data_batches[0].num_columns(), 2);
 
         Ok(())
     }
@@ -1958,7 +2002,7 @@ mod tests {
                 Decoder::new(Arc::new(HudiConfigs::empty()))
                     .with_row_filter(Some(ts_at_least(literal)))
                     .with_repair_table_schema(table)
-                    .decode_parquet_record_content(content.as_ref())
+                    .decode_parquet_record_content(content.as_ref(), &HashMap::new())
                     .unwrap()
                     .num_data_rows()
             };
