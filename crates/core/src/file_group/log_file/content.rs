@@ -175,6 +175,51 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
+/// What an Avro block's decoder is built from, besides the decoder itself.
+struct AvroBlockSetup {
+    registered: RegisteredWriterSchema,
+    /// The schema the block resolves to, or `None` to decode it as written.
+    reader_schema_json: Option<String>,
+    /// The schema a block is converted to after decoding, for a promotion Avro
+    /// cannot resolve.
+    rewrite_to: Option<Arc<Schema>>,
+}
+
+/// Every input [`AvroBlockSetup`] depends on. Compared in full rather than by
+/// a hash of the schema, so two different schemas can never share a setup.
+#[derive(PartialEq, Eq, Hash)]
+struct AvroBlockSetupKey {
+    writer_schema_json: String,
+    reader_schema_json: Option<String>,
+    projection: Option<Vec<String>>,
+    is_partial: bool,
+}
+
+/// Setups shared across decoders.
+///
+/// Working one out parses the writer schema to register and fingerprint it,
+/// narrows it to the projection, and parses both schemas again to check the
+/// promotions between them, and that took more time than decoding a typical
+/// block. A slice reads several log files, each through its own `Decoder`,
+/// and every block of a table's recent commits shares one writer schema, so
+/// a per-decoder cache saved little. The decoder itself is still built per
+/// block, because it carries per-stream state.
+static AVRO_BLOCK_SETUPS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<AvroBlockSetupKey, Arc<AvroBlockSetup>>>,
+> = std::sync::OnceLock::new();
+
+/// Setups kept before the cache starts over. A read needs one per writer
+/// schema and projection, so this is only a bound on a long-lived process.
+const AVRO_BLOCK_SETUPS_MAX: usize = 256;
+
+fn lock_setups() -> std::sync::MutexGuard<'static, HashMap<AvroBlockSetupKey, Arc<AvroBlockSetup>>>
+{
+    AVRO_BLOCK_SETUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
@@ -198,18 +243,6 @@ pub struct Decoder {
     hfile_as_records: bool,
     /// Keys the caller asked for, pushed into the HFile block index.
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
-    /// The last writer schema parsed and fingerprinted, reused by the next block
-    /// that carries the same one.
-    ///
-    /// Registering is schema-sized: it parses the schema to fingerprint it, which
-    /// on the metadata table's 8 KB record schema is about half the cost of
-    /// building a decoder, and a log file's blocks normally all share one writer
-    /// schema. Holds only data, so unlike the decoder it is safe to share; the
-    /// decoder itself is still built per block because it carries per-stream state.
-    ///
-    /// `RefCell` because `decode_content` takes `&self`, and a `Decoder` is built
-    /// per scan and used sequentially.
-    registered: std::cell::RefCell<Option<(String, RegisteredWriterSchema)>>,
 }
 
 impl Decoder {
@@ -312,7 +345,6 @@ impl Decoder {
             projection: None,
             hfile_as_records: false,
             key_predicate: None,
-            registered: std::cell::RefCell::new(None),
         }
     }
     pub fn decode_content(
@@ -399,6 +431,37 @@ impl Decoder {
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
+        let setup = self.avro_block_setup(writer_schema_json, is_partial)?;
+        let mut decoder = AvroBlockDecoder::try_new_with_registered(
+            &setup.registered,
+            setup.reader_schema_json.as_deref(),
+            self.batch_size,
+        )?;
+        if let Some(rewrite_to) = &setup.rewrite_to {
+            decoder = decoder.with_rewrite_to(rewrite_to.clone());
+        }
+        Ok(decoder)
+    }
+
+    /// Everything a block's decoder is built from except the decoder itself:
+    /// the registered writer schema and the schema it resolves to. These depend
+    /// only on the block's writer schema and this decoder's settings, so they
+    /// come from [`AVRO_BLOCK_SETUPS`] and are worked out once per process for
+    /// each combination rather than once per block.
+    fn avro_block_setup(
+        &self,
+        writer_schema_json: &str,
+        is_partial: bool,
+    ) -> Result<Arc<AvroBlockSetup>> {
+        let key = AvroBlockSetupKey {
+            writer_schema_json: writer_schema_json.to_string(),
+            reader_schema_json: self.reader_schema_json.clone(),
+            projection: self.projection.as_deref().cloned(),
+            is_partial,
+        };
+        if let Some(found) = lock_setups().get(&key) {
+            return Ok(found.clone());
+        }
         let narrowed = match (&self.reader_schema_json, &self.projection) {
             (None, Some(columns)) if !is_partial => {
                 narrow_avro_record(writer_schema_json, columns)?
@@ -434,30 +497,17 @@ impl Decoder {
             None => (None, None),
         };
 
-        // Registered once per writer schema rather than once per block. Compared,
-        // not hashed: a block with a different schema must not reuse another's
-        // fingerprint. One entry, since a log file normally carries one schema and
-        // a file that alternates simply re-registers rather than growing a map.
-        let registered = {
-            let mut slot = self.registered.borrow_mut();
-            match slot.as_ref() {
-                Some((json, reg)) if json == writer_schema_json => reg.clone(),
-                _ => {
-                    let reg = RegisteredWriterSchema::new(writer_schema_json)?;
-                    *slot = Some((writer_schema_json.to_string(), reg.clone()));
-                    reg
-                }
-            }
-        };
-        let mut decoder = AvroBlockDecoder::try_new_with_registered(
-            &registered,
-            reader_schema_json,
-            self.batch_size,
-        )?;
-        if let Some(rewrite_to) = rewrite_to {
-            decoder = decoder.with_rewrite_to(rewrite_to);
+        let setup = Arc::new(AvroBlockSetup {
+            registered: RegisteredWriterSchema::new(writer_schema_json)?,
+            reader_schema_json: reader_schema_json.map(str::to_string),
+            rewrite_to,
+        });
+        let mut setups = lock_setups();
+        if setups.len() >= AVRO_BLOCK_SETUPS_MAX {
+            setups.clear();
         }
-        Ok(decoder)
+        setups.insert(key, setup.clone());
+        Ok(setup)
     }
 
     /// An HFile block, in whichever shape the caller asked for.
