@@ -781,6 +781,27 @@ fn narrow_avro_record(writer_schema_json: &str, columns: &[String]) -> Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_avro_record_keeps_only_the_named_fields_in_writer_order() {
+        let writer = r#"{"type":"record","name":"r","fields":[
+            {"name":"a","type":"int"},
+            {"name":"b","type":["null","string"],"default":null},
+            {"name":"c","type":"long"}]}"#;
+        let narrowed = narrow_avro_record(writer, &["c".to_string(), "a".to_string()])
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&narrowed).unwrap();
+        let names: Vec<&str> = parsed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "c"]);
+        let all = ["a", "b", "c"].map(String::from);
+        assert!(narrow_avro_record(writer, &all).unwrap().is_none());
+    }
     use crate::file_group::log_file::log_block::LogBlockVersion;
     use apache_avro::to_avro_datum;
     use apache_avro::types::Record as AvroRecord;
