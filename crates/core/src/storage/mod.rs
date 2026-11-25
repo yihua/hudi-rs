@@ -438,15 +438,33 @@ impl Storage {
 
     /// A reader that fetches bounded windows instead of the whole file.
     ///
-    /// Only the object metadata is fetched here; no file bytes are read until
-    /// the caller reads.
+    /// The first window is fetched here, and the file's size comes with it.
     pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
-        let obj_meta = obj_store.head(&obj_path).await?;
         let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
             .map_err(StorageError::ReaderError)?;
+        // The first window, asked for by range, also says how large the file is,
+        // so the size lookup a streaming read otherwise starts with is one round
+        // trip saved. A read the store refuses (an empty file has no byte 0) falls
+        // back to that lookup.
+        let first = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(0..window_size)),
+            ..Default::default()
+        };
+        if let Ok(result) = obj_store.get_opts(&obj_path, first).await {
+            let obj_meta = result.meta.clone();
+            if let Ok(window) = result.bytes().await {
+                return Ok(StorageReader::new_streaming_with_first_window(
+                    obj_store,
+                    obj_meta,
+                    window_size,
+                    window,
+                ));
+            }
+        }
+        let obj_meta = obj_store.head(&obj_path).await?;
         Ok(StorageReader::new_streaming(
             obj_store,
             obj_meta,
