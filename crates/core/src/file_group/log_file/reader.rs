@@ -108,7 +108,8 @@ impl LogFileReader {
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let reader = storage.get_storage_reader(relative_path).await?;
+        let mut reader = storage.get_storage_reader(relative_path).await?;
+        reader.count_log_reads(storage.read_volume());
         let timezone: String = hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
@@ -132,9 +133,10 @@ impl LogFileReader {
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let reader = storage
+        let mut reader = storage
             .get_streaming_storage_reader_from_start(relative_path)
             .await?;
+        reader.count_log_reads(storage.read_volume());
         let timezone: String = hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
@@ -746,7 +748,7 @@ mod tests {
             base_url: url::Url,
             file_name: &str,
             window: &str,
-        ) -> Result<(usize, usize, usize, usize)> {
+        ) -> Result<(usize, usize, usize, usize, u64, u64)> {
             let configs = Arc::new(HudiConfigs::new([
                 (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
                 (HudiTableConfig::OrderingFields.as_ref(), "ts"),
@@ -755,18 +757,30 @@ mod tests {
             let (store, counts) =
                 CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
             let storage = Storage::new_with_object_store(base_url, store, configs.clone());
+            let volume = storage.read_volume();
             let mut reader = LogFileReader::new_streaming(configs, storage, file_name).await?;
             let blocks = reader.read_all_blocks_metadata_only_unbounded().await?;
             let resident = blocks
                 .iter()
                 .filter(|b| b.resident_content.is_some())
                 .count();
-            Ok((blocks.len(), resident, counts.gets(), counts.heads()))
+            Ok((
+                blocks.len(),
+                resident,
+                counts.gets(),
+                counts.heads(),
+                volume
+                    .log_io_calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                volume
+                    .log_bytes_read
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ))
         }
 
         // Inside one window: the walk holds every block's content, so nothing is
         // left to fetch and the whole file cost one request.
-        let (blocks, resident, gets, heads) =
+        let (blocks, resident, gets, heads, log_calls, log_bytes) =
             walk(base_url.clone(), &file_name, "16777216").await?;
         assert!(blocks > 0, "the fixture must hold blocks");
         assert_eq!(
@@ -778,10 +792,18 @@ mod tests {
             (1, 0),
             "one window fill, which also sizes the file, and nothing else"
         );
+        let file_len = std::fs::metadata(PathBuf::from(&dir).join(&file_name))
+            .unwrap()
+            .len();
+        assert_eq!(
+            (log_calls, log_bytes),
+            (1, file_len),
+            "the storage's read volume meters the fill as log bytes"
+        );
 
         // Smaller than the file: the walk cannot hold the content, so blocks defer
         // and each one's bytes cost a request of its own later. Unchanged behaviour.
-        let (blocks_small, resident_small, gets_small, _) =
+        let (blocks_small, resident_small, gets_small, _, _, _) =
             walk(base_url, &file_name, "64").await?;
         assert_eq!(blocks_small, blocks, "the same file holds the same blocks");
         assert_eq!(

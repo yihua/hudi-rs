@@ -623,7 +623,16 @@ impl ParquetBaseFileReader {
         let metadata = Self::object_reader(&self.storage, obj_path, file_size, true)
             .get_metadata(None)
             .await?;
+        self.record_footer_fetch(file_size);
         Ok((metadata, file_size))
+    }
+
+    /// Count a footer fetch from a file of `file_size` bytes: the reader asks
+    /// for the last `FOOTER_SIZE_HINT` bytes, or the whole file when smaller.
+    fn record_footer_fetch(&self, file_size: u64) {
+        self.storage
+            .read_volume
+            .add_footer_bytes(file_size.min(FOOTER_SIZE_HINT as u64));
     }
 
     #[allow(deprecated)]
@@ -674,7 +683,11 @@ impl ParquetBaseFileReader {
         // metadata accepts the file. The column chunks are untouched.
         let raw = match prefetched {
             Some(metadata) => metadata,
-            None => reader.get_metadata(None).await?,
+            None => {
+                let metadata = reader.get_metadata(None).await?;
+                self.record_footer_fetch(file_size);
+                metadata
+            }
         };
         let normalized = normalize_parquet_metadata(raw);
         let arrow_metadata = ArrowReaderMetadata::try_new(

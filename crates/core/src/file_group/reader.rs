@@ -90,6 +90,14 @@ impl std::fmt::Debug for FileGroupReader {
 }
 
 impl FileGroupReader {
+    /// What this reader's reads have fetched from storage so far: base file
+    /// footers and column data, and log file bytes, with the calls that carried
+    /// them. Cumulative across every slice read through this reader, so a
+    /// caller wanting one read's share takes the difference around it.
+    pub fn read_volume(&self) -> Arc<crate::storage::ReadVolume> {
+        self.storage.read_volume()
+    }
+
     /// Creates a new reader from base Hudi configs plus pre-split per-call
     /// overrides — Hudi configs and storage options live in separate maps so
     /// callers can't accidentally cross the streams.

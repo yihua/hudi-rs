@@ -183,6 +183,21 @@ pub struct ReadVolume {
     /// rows_out` is what filtering removed; `bytes_read` says what it cost to
     /// remove it.
     pub rows_out: AtomicU64,
+    /// Bytes requested for parquet base file footers. `bytes_read` counts only
+    /// the column data read after the footer, so a merge-on-read slice's base
+    /// file costs `footer_bytes_read + bytes_read`. A footer is fetched with a
+    /// size hint, so this is the hint (or the whole file, when smaller) per
+    /// footer rather than the footer's own length.
+    pub footer_bytes_read: AtomicU64,
+    /// Footer fetches, one per base file opened.
+    pub footer_io_calls: AtomicU64,
+    /// Bytes fetched from log files: block headers and the content of every
+    /// block a read decodes. With `footer_bytes_read` and `bytes_read` this is
+    /// what a merge-on-read scan fetched in all.
+    pub log_bytes_read: AtomicU64,
+    /// Calls into the object store for log file bytes. Like `io_calls`, a call
+    /// the store serves with several requests counts once.
+    pub log_io_calls: AtomicU64,
 }
 
 impl ReadVolume {
@@ -190,6 +205,18 @@ impl ReadVolume {
     pub(crate) fn add_bytes(&self, n: u64) {
         self.bytes_read.fetch_add(n, Ordering::Relaxed);
         self.io_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One footer fetch of `n` bytes.
+    pub(crate) fn add_footer_bytes(&self, n: u64) {
+        self.footer_bytes_read.fetch_add(n, Ordering::Relaxed);
+        self.footer_io_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `calls` calls into the store that returned `bytes` bytes of log files.
+    pub(crate) fn add_log_bytes(&self, calls: u64, bytes: u64) {
+        self.log_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+        self.log_io_calls.fetch_add(calls, Ordering::Relaxed);
     }
 
     /// What the file holds, read off the footer the reader has already fetched.
