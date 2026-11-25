@@ -662,11 +662,12 @@ impl HoodieFileGroupReader {
         let base = match base {
             Some(base) => base,
             None => {
-                let merge_schema = self.schema_handler.required_schema.clone().ok_or_else(|| {
-                    CoreError::ReadFileSliceError(
-                        "internal: a deferred base open needs the merge schema".to_string(),
-                    )
-                })?;
+                let merge_schema =
+                    self.schema_handler.required_schema.clone().ok_or_else(|| {
+                        CoreError::ReadFileSliceError(
+                            "internal: a deferred base open needs the merge schema".to_string(),
+                        )
+                    })?;
                 let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
                 let unfiltered = self.reader_context.row_filter_builder.is_none()
                     && self.reader_context.row_group_selector.is_none()
@@ -678,7 +679,7 @@ impl HoodieFileGroupReader {
                         .filter(|c| {
                             merge_schema
                                 .field_with_name(c)
-                                .is_ok_and(|f| can_stand_in(f.as_ref()))
+                                .is_ok_and(can_stand_in)
                         })
                         .collect(),
                     _ => Vec::new(),

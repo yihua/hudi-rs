@@ -400,7 +400,9 @@ impl Decoder {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
         let narrowed = match (&self.reader_schema_json, &self.projection) {
-            (None, Some(columns)) if !is_partial => narrow_avro_record(writer_schema_json, columns)?,
+            (None, Some(columns)) if !is_partial => {
+                narrow_avro_record(writer_schema_json, columns)?
+            }
             _ => None,
         };
         let reader_schema_json = if is_partial {
