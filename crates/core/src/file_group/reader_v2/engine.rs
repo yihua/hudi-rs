@@ -617,6 +617,88 @@ impl HoodieFileGroupReader {
         }))
     }
 
+    /// The base columns a merge that leaves `unneeded` unread may skip: those
+    /// the output does not carry either and that can be stood in for, and none
+    /// at all when a filter is evaluated on the way, since a filter may read any
+    /// merge column.
+    fn base_columns_to_skip(
+        &self,
+        unneeded: Vec<String>,
+        merge_schema: &SchemaRef,
+        output: Option<&SchemaRef>,
+    ) -> Vec<String> {
+        let unfiltered = self.reader_context.row_filter_builder.is_none()
+            && self.reader_context.row_group_selector.is_none()
+            && self.reader_context.key_predicate.is_none();
+        match output {
+            Some(output) if unfiltered => unneeded
+                .into_iter()
+                .filter(|c| {
+                    !output
+                        .fields()
+                        .iter()
+                        .any(|f| f.name().eq_ignore_ascii_case(c))
+                })
+                .filter(|c| merge_schema.field_with_name(c).is_ok_and(can_stand_in))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The base columns to skip if the log scan settles on the vectorized
+    /// position-based merge, for a read likely to: one that reads by position
+    /// under commit-time or event-time ordering. `None` for any other read,
+    /// which opens its base file after the scan.
+    fn speculative_position_skip(&self, output: Option<&SchemaRef>) -> Option<Vec<String>> {
+        if !self.use_record_position()
+            || !matches!(
+                self.reader_context.merge_mode.to_ascii_uppercase().as_str(),
+                "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING"
+            )
+        {
+            return None;
+        }
+        let merge_schema = self.schema_handler.required_schema.clone()?;
+        let record_context = self.reader_context.get_record_context();
+        let unneeded: Vec<String> = record_context
+            .record_key_fields
+            .iter()
+            .filter(|k| {
+                !record_context
+                    .ordering_field_names
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(k))
+            })
+            .cloned()
+            .collect();
+        Some(self.base_columns_to_skip(unneeded, &merge_schema, output))
+    }
+
+    /// Open the base file and decode its first batch, so its first requests
+    /// overlap whatever runs alongside.
+    async fn open_base_ahead(&mut self) -> Result<BaseSource> {
+        let BaseSource {
+            schema,
+            mut batches,
+        } = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        let batches = match batches.next().await {
+            Some(first) => futures::stream::once(async move { first })
+                .chain(batches)
+                .boxed(),
+            None => batches,
+        };
+        Ok(BaseSource { schema, batches })
+    }
+
+    /// Take the log scan's statistics, which it gathered into a copy of
+    /// `read_stats` so the base file could be opened alongside it. Only the
+    /// base open's own timing is kept from this side.
+    fn adopt_scan_stats(&mut self, stats: HoodieReadStats) {
+        let base_read_us = self.read_stats.base_read_us;
+        self.read_stats = stats;
+        self.read_stats.base_read_us = base_read_us;
+    }
+
     /// The batch size the caller asked for, or `MERGE_CHUNK_ROWS` when it set
     /// none (or an unusable one).
     fn caller_batch_rows(&self) -> usize {
@@ -713,23 +795,50 @@ impl HoodieFileGroupReader {
         );
         // A base file opened after the scan fetches its footer alongside it, so
         // the open is not one more round trip after the scan's.
-        let footer = match &base {
-            None => self.base_footer_prefetch(),
+        // A read that will most likely merge by position opens its base file
+        // alongside the log scan, with the columns that merge leaves unread,
+        // and decodes the first batch while the scan's requests are out. The
+        // scan then confirms the guess; when it does not (the blocks carry no
+        // usable positions, say), that open is dropped and the base file is
+        // opened again as below.
+        let speculative_skip = match &base {
+            None => self.speculative_position_skip(post_projection_schema.as_ref()),
             Some(_) => None,
         };
-        let scan = self.record_buffer_loader.get_record_buffer(
-            self.reader_context.clone(),
-            self.storage.clone(),
-            &self.input_split,
-            &self.reader_parameters,
-            &mut self.read_stats,
-        );
-        let (load_result, footer) = match footer {
-            Some(footer) => {
-                let (scanned, footer) = futures::join!(scan, footer);
-                (scanned, footer)
+        let footer = match (&base, &speculative_skip) {
+            (None, None) => self.base_footer_prefetch(),
+            _ => None,
+        };
+        let scan = {
+            let loader = DefaultFileGroupRecordBufferLoader::new();
+            let context = self.reader_context.clone();
+            let storage = self.storage.clone();
+            let split = self.input_split.clone();
+            let parameters = self.reader_parameters.clone();
+            let mut stats = self.read_stats.clone();
+            async move {
+                let loaded = loader
+                    .get_record_buffer(context, storage, &split, &parameters, &mut stats)
+                    .await;
+                (loaded, stats)
             }
-            None => (scan.await, None),
+        };
+        let mut opened_ahead: Option<Result<BaseSource>> = None;
+        let (load_result, footer) = if let Some(skip) = speculative_skip {
+            self.skip_base_columns = skip;
+            self.base_batch_rows = self.caller_batch_rows().max(MERGE_CHUNK_ROWS);
+            let ((loaded, stats), opened) = futures::join!(scan, self.open_base_ahead());
+            self.adopt_scan_stats(stats);
+            opened_ahead = Some(opened);
+            (loaded, None)
+        } else if let Some(footer) = footer {
+            let ((loaded, stats), footer) = futures::join!(scan, footer);
+            self.adopt_scan_stats(stats);
+            (loaded, footer)
+        } else {
+            let (loaded, stats) = scan.await;
+            self.adopt_scan_stats(stats);
+            (loaded, None)
         };
         let load_result = load_result?;
         self.prefetched_base_footer = footer;
@@ -751,27 +860,36 @@ impl HoodieFileGroupReader {
                         )
                     })?;
                 let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
-                if record_buffer.merges_base_by_position(&merge_schema)? {
-                    self.base_batch_rows = self.caller_batch_rows().max(MERGE_CHUNK_ROWS);
-                }
-                let unfiltered = self.reader_context.row_filter_builder.is_none()
-                    && self.reader_context.row_group_selector.is_none()
-                    && self.reader_context.key_predicate.is_none();
-                self.skip_base_columns = match &post_projection_schema {
-                    Some(output) if unfiltered => unneeded
-                        .into_iter()
-                        .filter(|c| {
-                            !output
-                                .fields()
-                                .iter()
-                                .any(|f| f.name().eq_ignore_ascii_case(c))
-                        })
-                        .filter(|c| merge_schema.field_with_name(c).is_ok_and(can_stand_in))
-                        .collect(),
-                    _ => Vec::new(),
+                let by_position = record_buffer.merges_base_by_position(&merge_schema)?;
+                let batch_rows = if by_position {
+                    self.caller_batch_rows().max(MERGE_CHUNK_ROWS)
+                } else {
+                    MERGE_CHUNK_ROWS
                 };
+                let skip = self.base_columns_to_skip(
+                    unneeded,
+                    &merge_schema,
+                    post_projection_schema.as_ref(),
+                );
+                let confirmed = match opened_ahead {
+                    Some(Ok(opened))
+                        if by_position
+                            && skip == self.skip_base_columns
+                            && batch_rows == self.base_batch_rows =>
+                    {
+                        Some(opened)
+                    }
+                    _ => None,
+                };
+                self.skip_base_columns = skip;
+                self.base_batch_rows = batch_rows;
                 self.read_stats.base_columns_skipped = self.skip_base_columns.len() as u64;
-                profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?
+                match confirmed {
+                    Some(opened) => opened,
+                    None => {
+                        profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?
+                    }
+                }
             }
         };
         let BaseSource {
