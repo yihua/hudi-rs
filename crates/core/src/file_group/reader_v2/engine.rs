@@ -143,9 +143,10 @@ pub struct HoodieFileGroupReader {
     base_batch_rows: usize,
 
     /// The base file's footer, fetched alongside the log scan when a merging
-    /// read defers opening its parquet base file until the scan is done. Taken
-    /// by the open; `None` there means the open fetches it.
-    prefetched_base_footer: Option<Arc<ParquetMetaData>>,
+    /// read defers opening its parquet base file until the scan is done, with
+    /// the file's size. Taken by the open; `None` there means the open fetches
+    /// it.
+    prefetched_base_footer: Option<(Arc<ParquetMetaData>, u64)>,
 
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
@@ -593,7 +594,7 @@ impl HoodieFileGroupReader {
     /// reporting whatever goes wrong there.
     fn base_footer_prefetch(
         &self,
-    ) -> Option<futures::future::BoxFuture<'static, Option<Arc<ParquetMetaData>>>> {
+    ) -> Option<futures::future::BoxFuture<'static, Option<(Arc<ParquetMetaData>, u64)>>> {
         let path = self.input_split.base_file_path.clone()?;
         if !crate::file_group::reader_v2::buffer::loader::base_file_is_parquet(
             &self.reader_context.base_file_format,
@@ -1258,8 +1259,12 @@ impl HoodieFileGroupReader {
         if let Some(size) = self.input_split.base_file_size {
             open_options = open_options.with_known_file_size(size);
         }
-        if let Some(footer) = self.prefetched_base_footer.take() {
-            open_options = open_options.with_parquet_metadata(footer);
+        // The prefetch learned the size if the split did not carry it, so the
+        // open needs no lookup of its own either.
+        if let Some((footer, size)) = self.prefetched_base_footer.take() {
+            open_options = open_options
+                .with_parquet_metadata(footer)
+                .with_known_file_size(size);
         }
         let base_stream = self
             .base_file_reader()?
