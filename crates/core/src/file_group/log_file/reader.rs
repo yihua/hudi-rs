@@ -133,8 +133,20 @@ impl LogFileReader {
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
+        Self::new_streaming_with_first_window(hudi_configs, storage, relative_path, None).await
+    }
+
+    /// [`Self::new_streaming`] whose first fetch is at most `first_window`
+    /// bytes: enough for the file's leading block headers, for a scan likely
+    /// to leave some block content unread.
+    pub async fn new_streaming_with_first_window(
+        hudi_configs: Arc<HudiConfigs>,
+        storage: Arc<Storage>,
+        relative_path: &str,
+        first_window: Option<u64>,
+    ) -> Result<Self> {
         let mut reader = storage
-            .get_streaming_storage_reader_from_start(relative_path)
+            .get_streaming_storage_reader_from_start_with(relative_path, first_window)
             .await?;
         reader.count_log_reads(storage.read_volume());
         let timezone: String = hudi_configs

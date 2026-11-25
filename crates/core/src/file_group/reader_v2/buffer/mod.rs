@@ -113,6 +113,15 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// The buffer inflates the block and extracts delete records internally.
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()>;
 
+    /// Called once the log blocks to merge are known, before their content is
+    /// fetched: whether this buffer needs the content of delete blocks, or
+    /// merges them from their headers alone. A buffer answering `false` is then
+    /// handed delete blocks with no content. The default needs it.
+    fn deletes_need_content(&mut self, blocks: &[LogBlock]) -> bool {
+        let _ = blocks;
+        true
+    }
+
     /// Process a single deleted record within a delete block.
     ///
     /// Mirrors Java's `processNextDeletedRecord(DeleteRecord, Serializable)`.

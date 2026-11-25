@@ -493,13 +493,26 @@ impl Storage {
         &self,
         relative_path: &str,
     ) -> Result<StorageReader> {
+        self.get_streaming_storage_reader_from_start_with(relative_path, None)
+            .await
+    }
+
+    /// [`Self::get_streaming_storage_reader_from_start`] with a first window of
+    /// at most `first_window` bytes, for a caller that expects to need only the
+    /// file's leading headers. Later refills use the configured window.
+    pub async fn get_streaming_storage_reader_from_start_with(
+        &self,
+        relative_path: &str,
+        first_window: Option<u64>,
+    ) -> Result<StorageReader> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
             .map_err(StorageError::ReaderError)?;
+        let first_size = first_window.map_or(window_size, |w| w.clamp(1, window_size));
         let first = object_store::GetOptions {
-            range: Some(object_store::GetRange::Bounded(0..window_size)),
+            range: Some(object_store::GetRange::Bounded(0..first_size)),
             ..Default::default()
         };
         if let Ok(result) = obj_store.get_opts(&obj_path, first).await {

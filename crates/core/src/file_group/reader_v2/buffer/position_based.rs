@@ -75,7 +75,7 @@ use arrow_schema::SchemaRef;
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
-use crate::file_group::log_file::log_block::{LogBlock, LogBlockContent};
+use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
 use crate::file_group::reader_v2::buffer::key_based::{BaseMatch, KeyBasedFileGroupRecordBuffer};
 use crate::file_group::reader_v2::buffer::record_positions::{
     base_row_position_array, decode_record_positions,
@@ -95,6 +95,11 @@ use crate::file_group::reader_v2::update_processor::UpdateStats;
 /// falls back to it when positions are unavailable.
 #[derive(Debug)]
 pub struct PositionBasedFileGroupRecordBuffer {
+    /// Set once the blocks to merge are known, when every one of them carries
+    /// usable positions under commit-time ordering: a delete then needs only
+    /// the positions in its header, and its content is neither fetched nor
+    /// decoded. See [`Self::deletes_need_content`].
+    header_only_deletes: bool,
     /// The key-based buffer whose merge kernels/state this reuses. After a
     /// fallback its records map holds record-key entries (position entries
     /// otherwise).
@@ -199,6 +204,7 @@ impl PositionBasedFileGroupRecordBuffer {
             None
         };
         Ok(Self {
+            header_only_deletes: false,
             inner,
             base_file_instant_time,
             should_use_position: true,
@@ -274,6 +280,21 @@ impl PositionBasedFileGroupRecordBuffer {
         positions: &[u64],
         batches: Vec<(RecordBatch, String)>,
     ) -> Result<()> {
+        // A header-only delete: the records map is keyed by position, and the
+        // record key is kept only for a fallback to the key-based merge, which
+        // `deletes_need_content` ruled out by checking every block's positions.
+        if batches.is_empty() {
+            for &position in positions {
+                self.note_position(position);
+                let delete_record = DeleteRecord {
+                    record_key: String::new(),
+                    ordering_value: None,
+                };
+                self.inner
+                    .process_next_deleted_record(delete_record, &Self::position_key(position))?;
+            }
+            return Ok(());
+        }
         let mut pos_idx = 0usize;
         for (batch, _inst) in batches {
             let delete_entries = self
@@ -1038,6 +1059,33 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         self.inner.process_next_data_record(record, key)
     }
 
+    /// A delete needs only its header's positions when the merge is by position
+    /// under commit-time ordering, where a delete always removes the base row at
+    /// its position whatever its ordering value, and every block to merge carries
+    /// positions against this base file, so nothing falls back to the key-based
+    /// merge, which would need the deleted keys.
+    fn deletes_need_content(&mut self, blocks: &[LogBlock]) -> bool {
+        let usable = |block: &LogBlock| {
+            !matches!(
+                block.block_type,
+                BlockType::AvroData
+                    | BlockType::ParquetData
+                    | BlockType::Delete
+                    | BlockType::HfileData
+            ) || (block
+                .base_file_instant_time_of_positions()
+                .is_some_and(|t| !t.is_empty() && t == self.base_file_instant_time)
+                && block
+                    .record_positions_header()
+                    .is_some_and(|p| !p.is_empty()))
+        };
+        self.header_only_deletes = self.should_use_position
+            && self.vectorized.is_some()
+            && self.inner.base.record_merge_mode == "COMMIT_TIME_ORDERING"
+            && blocks.iter().all(usable);
+        !self.header_only_deletes
+    }
+
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()> {
         if !self.should_use_position {
             return self.inner.process_delete_block(block);
@@ -1051,14 +1099,24 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             }
         };
 
-        if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
-            let batches = record_batches.delete_batches;
-            let rows: usize = batches.iter().map(|(b, _)| b.num_rows()).sum();
-            if rows != positions.len() {
-                return Err(record_count_mismatch("delete", rows, positions.len()));
+        match std::mem::take(&mut block.content) {
+            LogBlockContent::Records(record_batches) => {
+                let batches = record_batches.delete_batches;
+                let rows: usize = batches.iter().map(|(b, _)| b.num_rows()).sum();
+                if rows != positions.len() {
+                    return Err(record_count_mismatch("delete", rows, positions.len()));
+                }
+                let bytes: usize = batches.iter().map(|(b, _)| b.get_array_memory_size()).sum();
+                self.keep_or_ingest(PositionMergeBlock::Delete { positions, batches }, bytes)?;
             }
-            let bytes: usize = batches.iter().map(|(b, _)| b.get_array_memory_size()).sum();
-            self.keep_or_ingest(PositionMergeBlock::Delete { positions, batches }, bytes)?;
+            // Handed over without content because `deletes_need_content` said
+            // the positions suffice: each one removes its base row.
+            _ if self.header_only_deletes => {
+                let bytes = positions.len() * std::mem::size_of::<u64>();
+                let batches = Vec::new();
+                self.keep_or_ingest(PositionMergeBlock::Delete { positions, batches }, bytes)?;
+            }
+            _ => {}
         }
         Ok(())
     }

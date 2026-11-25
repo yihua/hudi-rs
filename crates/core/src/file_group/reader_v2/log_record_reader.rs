@@ -58,6 +58,11 @@ use futures::{StreamExt, TryStreamExt};
 /// many windows; content kept past the walk is bounded by one shared budget.
 const LOG_FILE_WALK_CONCURRENCY: usize = 4;
 
+/// First fetch from each log file when the scan expects to need only block
+/// headers from some of them: a block header with its schema and a position
+/// bitmap for tens of thousands of records fits well inside this.
+const HEADER_WINDOW_BYTES: u64 = 256 * 1024;
+
 // =========================================================================
 // Pass 1 result
 // =========================================================================
@@ -537,13 +542,28 @@ impl BaseHoodieLogRecordReader {
             // one shared budget.
             let paths = self.log_file_paths.clone();
             let storage = self.storage.clone();
+            // A merge by position under commit-time ordering takes deletes from
+            // their headers alone (see `deletes_need_content`), so the walk first
+            // asks for just the headers' worth of each file rather than a whole
+            // window, and a delete block's content is never fetched.
+            let first_window = (self.reader_context.should_merge_use_record_position
+                && self
+                    .reader_context
+                    .merge_mode
+                    .eq_ignore_ascii_case("COMMIT_TIME_ORDERING"))
+            .then_some(HEADER_WINDOW_BYTES);
             let walks = paths.into_iter().map(|path: String| {
                 let hudi_configs = hudi_configs.clone();
                 let storage = storage.clone();
                 let resident_budget = resident_budget.clone();
                 async move {
-                    let mut reader =
-                        LogFileReader::new_streaming(hudi_configs, storage, &path).await?;
+                    let mut reader = LogFileReader::new_streaming_with_first_window(
+                        hudi_configs,
+                        storage,
+                        &path,
+                        first_window,
+                    )
+                    .await?;
                     let blocks = reader
                         .read_all_blocks_metadata_only(&resident_budget)
                         .await?;
@@ -702,26 +722,53 @@ impl BaseHoodieLogRecordReader {
         let budget = crate::storage::reader::stream_window_size(hudi_configs)
             .map_err(crate::error::CoreError::ReadLogFileError)?;
         let decoder = self.block_decoder();
-        let windows = Self::plan_content_windows(ordered, budget);
+        // Asked before anything is fetched: a buffer that merges deletes from
+        // their headers alone has their content neither fetched nor decoded.
+        let deletes_need_content = self.record_buffer.deletes_need_content(ordered);
+        let windows = Self::plan_content_windows_for(ordered, budget, deletes_need_content);
         log::debug!(
             "[Pass3] {} block(s) to merge in {} window(s), budget {budget} bytes",
             ordered.len(),
             windows.len(),
         );
 
+        // Windows are per file, so a slice whose log files each need content has
+        // one window per file. As many as fit the budget together are fetched at
+        // once rather than one round trip after another.
         let mut block_num = 0u64;
         let mut cursor = 0usize;
-        for window in windows {
+        let mut next = 0usize;
+        while next < windows.len() {
+            let mut end = next;
+            let mut bytes = 0u64;
+            while end < windows.len() {
+                let size = Self::window_bytes(ordered, &windows[end]);
+                if end > next && bytes.saturating_add(size) > budget {
+                    break;
+                }
+                bytes = bytes.saturating_add(size);
+                end += 1;
+            }
+            let group = &windows[next..end];
+            let blocks: &[LogBlock] = ordered;
+            let fetches = group.iter().map(|window| async move {
+                let mut fetched = HashMap::new();
+                Self::fetch_window(blocks, window, &mut fetched).await?;
+                Ok::<_, crate::error::CoreError>(fetched)
+            });
             let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
-            profile_add!(
+            for part in profile_add!(
                 self.log_block_fetch_us,
-                Self::fetch_window(ordered, &window, &mut fetched).await
-            )?;
-            // Merge everything up to and including this window's last block, so
+                futures::future::try_join_all(fetches).await
+            )? {
+                fetched.extend(part);
+            }
+            // Merge everything up to and including the group's last block, so
             // blocks with nothing to fetch (command, corrupt, already-decoded)
             // keep their place in the oldest-first order.
-            let through = *window
+            let through = *group
                 .last()
+                .and_then(|w| w.last())
                 .expect("plan_content_windows never emits an empty window");
             self.merge_blocks(
                 ordered,
@@ -729,38 +776,47 @@ impl BaseHoodieLogRecordReader {
                 &mut fetched,
                 &decoder,
                 &mut block_num,
+                deletes_need_content,
             )?;
             cursor = through + 1;
-            // `fetched` drops here: the next window is fetched against a fresh budget.
+            next = end;
+            // `fetched` drops here: the next group is fetched against a fresh budget.
         }
         if cursor < ordered.len() {
             let mut none = HashMap::new();
             let last = ordered.len() - 1;
-            self.merge_blocks(ordered, cursor..=last, &mut none, &decoder, &mut block_num)?;
+            self.merge_blocks(
+                ordered,
+                cursor..=last,
+                &mut none,
+                &decoder,
+                &mut block_num,
+                deletes_need_content,
+            )?;
         }
         Ok(())
     }
 
-    /// Group the admitted blocks' content reads into windows, in consumption order.
-    ///
-    /// A window is a run of *consecutive* blocks that share a file and whose
-    /// content fits the budget. Consecutiveness is what makes a window safe to
-    /// fetch and merge before the next one is fetched: Pass 3 merges oldest-first
-    /// and a later block overwrites an earlier one for the same key, so a plan
-    /// that reordered blocks would change the merged result. Grouping by file
-    /// first is enough for a bulk prefetch, whose result is keyed by index and
-    /// consumed in the caller's order, but it cannot be interleaved with merging
-    /// for exactly that reason.
-    ///
-    /// Windows never span files, because a `LogBlockFetcher` reads one file. A
-    /// window stops before it would exceed `budget`; a block bigger than the
-    /// budget still goes out alone rather than being split, since its content
-    /// has to be whole to decode.
-    ///
-    /// Blocks that carry no content, or nothing deferred, are left out: they
-    /// have nothing to fetch. They are still merged in order — see
-    /// [`Self::fetch_and_merge_windows`], which walks the gaps between windows.
+    /// Content bytes a window fetches.
+    fn window_bytes(blocks: &[LogBlock], window: &[usize]) -> u64 {
+        window
+            .iter()
+            .filter_map(|idx| blocks[*idx].deferred_content.as_ref())
+            .map(|d| d.location.content_length)
+            .sum()
+    }
+
     fn plan_content_windows(blocks: &[LogBlock], budget: u64) -> Vec<Vec<usize>> {
+        Self::plan_content_windows_for(blocks, budget, true)
+    }
+
+    /// [`Self::plan_content_windows`], leaving out delete blocks when their
+    /// content is not needed.
+    fn plan_content_windows_for(
+        blocks: &[LogBlock],
+        budget: u64,
+        deletes_need_content: bool,
+    ) -> Vec<Vec<usize>> {
         use crate::file_group::log_file::log_block::DeferredContent;
 
         let mut windows: Vec<Vec<usize>> = Vec::new();
@@ -780,6 +836,9 @@ impl BaseHoodieLogRecordReader {
             }
             // Holding its own bytes already: nothing to fetch for this one.
             if block.resident_content.is_some() {
+                continue;
+            }
+            if !deletes_need_content && block.block_type == BlockType::Delete {
                 continue;
             }
             let Some(DeferredContent { fetcher, location }) = block.deferred_content.as_ref()
@@ -977,6 +1036,7 @@ impl BaseHoodieLogRecordReader {
         fetched: &mut HashMap<usize, bytes::Bytes>,
         block_decoder: &crate::file_group::log_file::content::Decoder,
         block_num: &mut u64,
+        deletes_need_content: bool,
     ) -> Result<()> {
         for idx in range {
             let block = &mut ordered[idx];
@@ -1000,9 +1060,16 @@ impl BaseHoodieLogRecordReader {
                 block.resident_content = None;
             }
 
+            // A delete merged from its header alone is not decoded, and gives up
+            // whatever bytes the walk held for it.
+            if !deletes_need_content && block.block_type == BlockType::Delete {
+                block.resident_content = None;
+            }
+
             // Decode this block's content now that it is known to be admitted. A
             // block that already has content passes straight through.
             match block.block_type {
+                BlockType::Delete if !deletes_need_content => {}
                 BlockType::AvroData
                 | BlockType::ParquetData
                 | BlockType::Delete
