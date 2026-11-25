@@ -175,6 +175,9 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
+/// The most rows an Avro data block is decoded into per batch.
+const AVRO_DATA_BATCH_ROWS_MAX: usize = 65_536;
+
 /// What an Avro block's decoder is built from, besides the decoder itself.
 struct AvroBlockSetup {
     registered: RegisteredWriterSchema,
@@ -417,6 +420,7 @@ impl Decoder {
         &self,
         writer_schema_json: &str,
         header: &HashMap<BlockMetadataKey, String>,
+        batch_rows: usize,
     ) -> Result<AvroBlockDecoder> {
         // A partial-update block carries only the columns that were written, and
         // the merge needs to know which those are. Resolving it up to the table
@@ -435,7 +439,7 @@ impl Decoder {
         let mut decoder = AvroBlockDecoder::try_new_with_registered(
             &setup.registered,
             setup.reader_schema_json.as_deref(),
-            self.batch_size,
+            batch_rows,
         )?;
         if let Some(rewrite_to) = &setup.rewrite_to {
             decoder = decoder.with_rewrite_to(rewrite_to.clone());
@@ -532,7 +536,7 @@ impl Decoder {
                     .to_string(),
             )
         })?;
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, self.batch_size)?;
         let mut decoded: Vec<arrow_array::RecordBatch> = Vec::new();
         for record in &records {
             if let Some(batch) = decoder.decode(&record.value)? {
@@ -599,9 +603,15 @@ impl Decoder {
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
+        // The block says how many records it holds, so it is decoded in batches
+        // of up to that many rather than `batch_size`: the decoder is rebuilt
+        // after every full batch (see `AvroBlockDecoder::decode`), and at
+        // `batch_size` rows a block of tens of thousands of records spent more
+        // time rebuilding it than decoding some of its columns.
+        let batch_rows = (record_count as usize).clamp(1, AVRO_DATA_BATCH_ROWS_MAX);
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, batch_rows)?;
         let mut batches =
-            RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
+            RecordBatches::new_with_capacity(record_count as usize / batch_rows + 1, 0);
 
         // Each datum is framed by Hudi with a four-byte length, so the bodies
         // are read here and handed over one at a time.
