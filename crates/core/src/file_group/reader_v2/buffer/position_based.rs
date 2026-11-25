@@ -1947,10 +1947,7 @@ mod tests {
         let reads = buffer.base_columns_unneeded(&schema()).unwrap().is_empty();
         // Only the merge by position alone does without the key, and that is
         // the merge whose base batches may be read larger.
-        assert_eq!(
-            buffer.merges_base_by_position(&schema()).unwrap(),
-            !reads
-        );
+        assert_eq!(buffer.merges_base_by_position(&schema()).unwrap(), !reads);
         reads
     }
 
