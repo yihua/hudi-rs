@@ -433,6 +433,41 @@ impl Storage {
         ))
     }
 
+    /// [`Self::get_streaming_storage_reader`] for a caller that reads the file
+    /// from its start, such as a log file's block walk.
+    ///
+    /// The first window is fetched here, by range, and the response also says
+    /// how large the file is, which saves the size lookup the other open starts
+    /// with. A read the store refuses (an empty file has no byte 0) falls back to
+    /// that lookup. A caller that starts elsewhere, such as an HFile's trailer,
+    /// would pay for a window it does not read, and uses the other open.
+    pub async fn get_streaming_storage_reader_from_start(
+        &self,
+        relative_path: &str,
+    ) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        let first = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(0..window_size)),
+            ..Default::default()
+        };
+        if let Ok(result) = obj_store.get_opts(&obj_path, first).await {
+            let obj_meta = result.meta.clone();
+            if let Ok(window) = result.bytes().await {
+                return Ok(StorageReader::new_streaming_with_first_window(
+                    obj_store,
+                    obj_meta,
+                    window_size,
+                    window,
+                ));
+            }
+        }
+        self.get_streaming_storage_reader(relative_path).await
+    }
+
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
         let dir_paths = self.list_dirs_as_obj_paths(subdir).await?;
         let mut dirs = Vec::new();
