@@ -887,9 +887,9 @@ fn newer_log_wins(
             if old_is_delete && is_default_ordering(old_ordering) {
                 return false;
             }
-            !(!is_default_ordering(new_ordering)
-                && matches!((new_ordering, old_ordering),
-                    (Some(d), Some(o)) if d.is_same_class(o) && o > d))
+            is_default_ordering(new_ordering)
+                || !matches!((new_ordering, old_ordering),
+                    (Some(d), Some(o)) if d.is_same_class(o) && o > d)
         }
         // `should_keep_newer_record`: a commit-time-ordering delete on either side
         // keeps the newer record; otherwise the newer wins on `>=` or a
@@ -1849,14 +1849,26 @@ mod tests {
         let has = |k: &str, c: i32, t: i64| direct.contains(&(k.to_string(), c, t));
         assert!(has("k1", 1, 5), "an older log record loses to the base row");
         assert!(has("k2", 200, 5), "a tie goes to the log");
-        assert!(has("k3", 300, 9), "an older delete loses to the newer log update");
-        assert!(has("k4", 4, 5), "a delete older than the base row is obsolete");
-        assert!(has("k7", 700, 9), "the higher-ordered log record wins the fold");
+        assert!(
+            has("k3", 300, 9),
+            "an older delete loses to the newer log update"
+        );
+        assert!(
+            has("k4", 4, 5),
+            "a delete older than the base row is obsolete"
+        );
+        assert!(
+            has("k7", 700, 9),
+            "the higher-ordered log record wins the fold"
+        );
         assert!(has("k12", 12, 5));
         assert!(has("k15", 1500, 8));
         assert!(has("k40", 4000, 1), "an update past the base is emitted");
         for gone in ["k6", "k8", "k9"] {
-            assert!(!direct.iter().any(|(k, _, _)| k == gone), "{gone} is deleted");
+            assert!(
+                !direct.iter().any(|(k, _, _)| k == gone),
+                "{gone} is deleted"
+            );
         }
     }
 
