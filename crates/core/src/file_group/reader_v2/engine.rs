@@ -801,6 +801,7 @@ impl HoodieFileGroupReader {
         // scan then confirms the guess; when it does not (the blocks carry no
         // usable positions, say), that open is dropped and the base file is
         // opened again as below.
+        let diag_t0 = std::time::Instant::now();
         let speculative_skip = match &base {
             None => self.speculative_position_skip(post_projection_schema.as_ref()),
             Some(_) => None,
@@ -841,6 +842,8 @@ impl HoodieFileGroupReader {
             (loaded, None)
         };
         let load_result = load_result?;
+        let diag_scan_us = diag_t0.elapsed().as_micros();
+        let diag_spec = opened_ahead.as_ref().map(|o| o.is_ok());
         self.prefetched_base_footer = footer;
 
         let mut record_buffer = load_result.record_buffer;
@@ -859,8 +862,10 @@ impl HoodieFileGroupReader {
                             "internal: a deferred base open needs the merge schema".to_string(),
                         )
                     })?;
+                let diag_index_t0 = std::time::Instant::now();
                 let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
                 let by_position = record_buffer.merges_base_by_position(&merge_schema)?;
+                let diag_index_us = diag_index_t0.elapsed().as_micros();
                 let batch_rows = if by_position {
                     self.caller_batch_rows().max(MERGE_CHUNK_ROWS)
                 } else {
@@ -884,12 +889,40 @@ impl HoodieFileGroupReader {
                 self.skip_base_columns = skip;
                 self.base_batch_rows = batch_rows;
                 self.read_stats.base_columns_skipped = self.skip_base_columns.len() as u64;
-                match confirmed {
+                let diag_confirmed = confirmed.is_some();
+                let base = match confirmed {
                     Some(opened) => opened,
                     None => {
                         profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?
                     }
-                }
+                };
+                eprintln!(
+                    "HUDIDIAG2 t={} file={} by_position={} spec={:?} confirmed={} scan_us={} index_us={} ready_us={} walk_us={} fetch_us={} decode_us={} insert_us={} upsert_us={} base_open_us={} log_records={} log_blocks={}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0),
+                    self.input_split
+                        .base_file_path
+                        .as_deref()
+                        .and_then(|p| p.rsplit('/').next())
+                        .unwrap_or(""),
+                    by_position,
+                    diag_spec,
+                    diag_confirmed,
+                    diag_scan_us,
+                    diag_index_us,
+                    diag_t0.elapsed().as_micros(),
+                    self.read_stats.log_block_read_us,
+                    self.read_stats.log_block_fetch_us,
+                    self.read_stats.log_block_decode_us,
+                    self.read_stats.merge_insert_us,
+                    self.read_stats.merge_upsert_us,
+                    self.read_stats.base_read_us,
+                    self.read_stats.total_log_records,
+                    self.read_stats.total_log_blocks,
+                );
+                base
             }
         };
         let BaseSource {
