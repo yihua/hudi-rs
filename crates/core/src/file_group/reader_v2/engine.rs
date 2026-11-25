@@ -132,6 +132,13 @@ pub struct HoodieFileGroupReader {
     /// after the log scan, before a merging read opens the base file.
     skip_base_columns: Vec<String>,
 
+    /// Rows per base batch. `MERGE_CHUNK_ROWS` unless the log scan settled on
+    /// the vectorized position-based merge, whose per-batch work is a filter
+    /// and a gather rather than a lookup per row, so the base is read in the
+    /// caller's batch size (`hoodie.read.stream.batch_size`) as a base-only
+    /// read would be.
+    base_batch_rows: usize,
+
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
@@ -157,6 +164,10 @@ pub struct HoodieFileGroupReader {
 /// larger default upstream would multiply the blocking above with nothing
 /// failing. Measured by `spilled_merge_blocking_duration` (ignored; run with
 /// `--release --ignored --nocapture`).
+///
+/// The vectorized position-based merge is the exception: it merges a base
+/// batch with a filter and a gather, not a lookup per row, so a read that
+/// settles on it uses the caller's batch size instead (`base_batch_rows`).
 const MERGE_CHUNK_ROWS: usize = 1024;
 
 /// Base-file read options carrying an optional pushdown predicate, and the
@@ -443,6 +454,7 @@ impl HoodieFileGroupReader {
             stream_stats: new_stream_stats_handle(),
             valid_block_instants: Vec::new(),
             skip_base_columns: Vec::new(),
+            base_batch_rows: MERGE_CHUNK_ROWS,
             buffered_record_converter: None,
         })
     }
@@ -558,6 +570,17 @@ impl HoodieFileGroupReader {
         self.read_stats.num_deletes = s.num_deletes;
     }
 
+    /// The batch size the caller asked for, or `MERGE_CHUNK_ROWS` when it set
+    /// none (or an unusable one).
+    fn caller_batch_rows(&self) -> usize {
+        self.reader_context
+            .hoodie_reader_config
+            .get(crate::config::read::HudiReadConfig::StreamBatchSize.as_ref())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MERGE_CHUNK_ROWS)
+    }
+
     /// Initialize record iterators: read base file + scan/merge log files,
     /// hand state to a [`FileGroupMergeStream`].
     ///
@@ -669,6 +692,9 @@ impl HoodieFileGroupReader {
                         )
                     })?;
                 let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
+                if record_buffer.merges_base_by_position(&merge_schema)? {
+                    self.base_batch_rows = self.caller_batch_rows().max(MERGE_CHUNK_ROWS);
+                }
                 let unfiltered = self.reader_context.row_filter_builder.is_none()
                     && self.reader_context.row_group_selector.is_none()
                     && self.reader_context.key_predicate.is_none();
@@ -1044,6 +1070,7 @@ impl HoodieFileGroupReader {
             .unwrap_or_else(|| required_schema.clone());
         let repair_risk_columns = self.reader_context.repair_risk_columns.clone();
         let skip_columns = self.skip_base_columns.clone();
+        let batch_rows = self.base_batch_rows;
         let volume = self.storage.read_volume();
         let choose_path = path.clone();
         // The open speaks storage errors; a schema decision that fails here is
@@ -1152,6 +1179,7 @@ impl HoodieFileGroupReader {
                 // evolved/added cols.
                 Ok(
                     base_read_options(row_filter, row_group_selector, key_predicate, use_position)
+                        .with_batch_size(batch_rows)
                         .with_projection(present.iter().map(|f| f.name())),
                 )
             };
