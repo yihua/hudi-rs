@@ -592,16 +592,55 @@ impl ParquetBaseFileReader {
         Ok(options.with_virtual_columns(vec![row_number])?)
     }
 
+    /// Fetch a file's footer, to open it later with
+    /// [`BaseFileReadOptions::with_parquet_metadata`].
+    ///
+    /// A merging read opens its base file only once the log scan has said which
+    /// columns the merge needs, and the footer it then fetches is one more round
+    /// trip after the scan's. Fetched alongside the scan instead, the open
+    /// starts from it.
+    pub(crate) async fn fetch_metadata(
+        &self,
+        relative_path: &str,
+        known_file_size: Option<u64>,
+    ) -> Result<Arc<ParquetMetaData>> {
+        let (obj_path, file_size) = self
+            .object_path_knowing(relative_path, known_file_size)
+            .await?;
+        Ok(Self::object_reader(&self.storage, obj_path, file_size)
+            .get_metadata(None)
+            .await?)
+    }
+
+    #[allow(deprecated)]
+    fn object_reader(storage: &Storage, obj_path: ObjPath, file_size: u64) -> ParquetObjectReader {
+        ParquetObjectReader::new(storage.object_store.clone(), obj_path)
+            .with_file_size(file_size)
+            .with_footer_size_hint(FOOTER_SIZE_HINT)
+    }
+
+    async fn object_path_knowing(
+        &self,
+        relative_path: &str,
+        known_file_size: Option<u64>,
+    ) -> Result<(ObjPath, u64)> {
+        match known_file_size {
+            Some(size) => {
+                let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+                Ok((ObjPath::from_url_path(obj_url.path())?, size))
+            }
+            None => self.object_path_and_size(relative_path).await,
+        }
+    }
+
     async fn open_builder_with_size(
         &self,
         obj_path: ObjPath,
         file_size: u64,
         row_index_column: Option<&str>,
+        prefetched: Option<Arc<ParquetMetaData>>,
     ) -> Result<(CountedBuilder, ReadPlanCell)> {
-        #[allow(deprecated)]
-        let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
-            .with_file_size(file_size)
-            .with_footer_size_hint(FOOTER_SIZE_HINT);
+        let mut reader = Self::object_reader(&self.storage, obj_path, file_size);
 
         // A parquet-avro writer with `write-old-list-structure=true` encodes an
         // `array<map>` as a legacy 2-level list whose element is a REPEATED map
@@ -609,7 +648,10 @@ impl ParquetBaseFileReader {
         // schema — "Map cannot be repeated". The footer parse itself does not,
         // so the schema is rewritten in between and every reader built from this
         // metadata accepts the file. The column chunks are untouched.
-        let raw = reader.get_metadata(None).await?;
+        let raw = match prefetched {
+            Some(metadata) => metadata,
+            None => reader.get_metadata(None).await?,
+        };
         let normalized = normalize_parquet_metadata(raw);
         let arrow_metadata = ArrowReaderMetadata::try_new(
             normalized,
@@ -634,7 +676,7 @@ impl ParquetBaseFileReader {
         relative_path: &str,
         row_index_column: Option<&str>,
     ) -> Result<(CountedBuilder, ReadPlanCell)> {
-        self.open_builder_knowing(relative_path, row_index_column, None)
+        self.open_builder_knowing(relative_path, row_index_column, None, None)
             .await
     }
 
@@ -646,15 +688,12 @@ impl ParquetBaseFileReader {
         relative_path: &str,
         row_index_column: Option<&str>,
         known_file_size: Option<u64>,
+        prefetched: Option<Arc<ParquetMetaData>>,
     ) -> Result<(CountedBuilder, ReadPlanCell)> {
-        let (obj_path, file_size) = match known_file_size {
-            Some(size) => {
-                let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
-                (ObjPath::from_url_path(obj_url.path())?, size)
-            }
-            None => self.object_path_and_size(relative_path).await?,
-        };
-        self.open_builder_with_size(obj_path, file_size, row_index_column)
+        let (obj_path, file_size) = self
+            .object_path_knowing(relative_path, known_file_size)
+            .await?;
+        self.open_builder_with_size(obj_path, file_size, row_index_column, prefetched)
             .await
     }
 
@@ -883,6 +922,7 @@ impl BaseFileReader for ParquetBaseFileReader {
                     relative_path,
                     options.row_index_column.as_deref(),
                     options.known_file_size,
+                    options.parquet_metadata.clone(),
                 )
                 .await?;
             self.stream_from_builder(builder, &plan, &options)
@@ -903,6 +943,7 @@ impl BaseFileReader for ParquetBaseFileReader {
                     relative_path,
                     open_options.row_index_column.as_deref(),
                     open_options.known_file_size,
+                    open_options.parquet_metadata.clone(),
                 )
                 .await?;
             let file_schema = Self::file_schema(&builder, open_options.row_index_column.as_deref());
@@ -932,7 +973,7 @@ impl BaseFileReader for ParquetBaseFileReader {
         Box::pin(async move {
             let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
             let (builder, _) = self
-                .open_builder_with_size(obj_path, file_size, None)
+                .open_builder_with_size(obj_path, file_size, None, None)
                 .await?;
             let parquet_meta = builder.metadata().as_ref();
 

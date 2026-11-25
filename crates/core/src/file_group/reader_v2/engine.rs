@@ -26,6 +26,7 @@ use crate::Result;
 use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::base_file::hfile::HFileBaseFileReader;
+use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::file_group::base_file::reader::{
     BaseFileReadOptions, BaseFileReader, create_base_file_reader,
 };
@@ -50,6 +51,7 @@ use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
+use parquet::file::metadata::ParquetMetaData;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -138,6 +140,11 @@ pub struct HoodieFileGroupReader {
     /// caller's batch size (`hoodie.read.stream.batch_size`) as a base-only
     /// read would be.
     base_batch_rows: usize,
+
+    /// The base file's footer, fetched alongside the log scan when a merging
+    /// read defers opening its parquet base file until the scan is done. Taken
+    /// by the open; `None` there means the open fetches it.
+    prefetched_base_footer: Option<Arc<ParquetMetaData>>,
 
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
@@ -463,6 +470,7 @@ impl HoodieFileGroupReader {
             valid_block_instants: Vec::new(),
             skip_base_columns: Vec::new(),
             base_batch_rows: MERGE_CHUNK_ROWS,
+            prefetched_base_footer: None,
             buffered_record_converter: None,
         })
     }
@@ -578,6 +586,31 @@ impl HoodieFileGroupReader {
         self.read_stats.num_deletes = s.num_deletes;
     }
 
+    /// Fetch the base file's footer, for a merging read that opens its parquet
+    /// base file only after the log scan. `None` when there is nothing to fetch.
+    /// A failed fetch yields `None` and the open fetches the footer itself,
+    /// reporting whatever goes wrong there.
+    fn base_footer_prefetch(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Option<Arc<ParquetMetaData>>>> {
+        let path = self.input_split.base_file_path.clone()?;
+        if !crate::file_group::reader_v2::buffer::loader::base_file_is_parquet(
+            &self.reader_context.base_file_format,
+        ) || !self.base_file_in_range().unwrap_or(false)
+        {
+            return None;
+        }
+        let reader = ParquetBaseFileReader::new(self.storage.clone());
+        let size = self.input_split.base_file_size;
+        Some(Box::pin(async move {
+            reader
+                .fetch_metadata(&path, size)
+                .await
+                .inspect_err(|e| log::debug!("prefetching the footer of '{path}' failed: {e}"))
+                .ok()
+        }))
+    }
+
     /// The batch size the caller asked for, or `MERGE_CHUNK_ROWS` when it set
     /// none (or an unusable one).
     fn caller_batch_rows(&self) -> usize {
@@ -672,16 +705,28 @@ impl HoodieFileGroupReader {
             self.input_split.log_file_paths.len(),
             self.reader_context.latest_commit_time,
         );
-        let load_result = self
-            .record_buffer_loader
-            .get_record_buffer(
-                self.reader_context.clone(),
-                self.storage.clone(),
-                &self.input_split,
-                &self.reader_parameters,
-                &mut self.read_stats,
-            )
-            .await?;
+        // A base file opened after the scan fetches its footer alongside it, so
+        // the open is not one more round trip after the scan's.
+        let footer = match &base {
+            None => self.base_footer_prefetch(),
+            Some(_) => None,
+        };
+        let scan = self.record_buffer_loader.get_record_buffer(
+            self.reader_context.clone(),
+            self.storage.clone(),
+            &self.input_split,
+            &self.reader_parameters,
+            &mut self.read_stats,
+        );
+        let (load_result, footer) = match footer {
+            Some(footer) => {
+                let (scanned, footer) = futures::join!(scan, footer);
+                (scanned, footer)
+            }
+            None => (scan.await, None),
+        };
+        let load_result = load_result?;
+        self.prefetched_base_footer = footer;
 
         let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
@@ -1200,6 +1245,9 @@ impl HoodieFileGroupReader {
         }
         if let Some(size) = self.input_split.base_file_size {
             open_options = open_options.with_known_file_size(size);
+        }
+        if let Some(footer) = self.prefetched_base_footer.take() {
+            open_options = open_options.with_parquet_metadata(footer);
         }
         let base_stream = self
             .base_file_reader()?
