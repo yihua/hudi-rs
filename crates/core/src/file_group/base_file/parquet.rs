@@ -604,8 +604,9 @@ impl ParquetBaseFileReader {
         Ok(options.with_virtual_columns(vec![row_number])?)
     }
 
-    /// Fetch a file's footer, to open it later with
-    /// [`BaseFileReadOptions::with_parquet_metadata`].
+    /// Fetch a file's footer, and its size, to open it later with
+    /// [`BaseFileReadOptions::with_parquet_metadata`] and
+    /// [`BaseFileReadOptions::with_known_file_size`].
     ///
     /// A merging read opens its base file only once the log scan has said which
     /// columns the merge needs, and the footer it then fetches is one more round
@@ -615,15 +616,14 @@ impl ParquetBaseFileReader {
         &self,
         relative_path: &str,
         known_file_size: Option<u64>,
-    ) -> Result<Arc<ParquetMetaData>> {
+    ) -> Result<(Arc<ParquetMetaData>, u64)> {
         let (obj_path, file_size) = self
             .object_path_knowing(relative_path, known_file_size)
             .await?;
-        Ok(
-            Self::object_reader(&self.storage, obj_path, file_size, true)
-                .get_metadata(None)
-                .await?,
-        )
+        let metadata = Self::object_reader(&self.storage, obj_path, file_size, true)
+            .get_metadata(None)
+            .await?;
+        Ok((metadata, file_size))
     }
 
     #[allow(deprecated)]

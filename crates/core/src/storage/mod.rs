@@ -438,17 +438,39 @@ impl Storage {
 
     /// A reader that fetches bounded windows instead of the whole file.
     ///
-    /// The first window is fetched here, and the file's size comes with it.
+    /// Only the object metadata is fetched here; no file bytes are read until
+    /// the caller reads.
     pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        Ok(StorageReader::new_streaming(
+            obj_store,
+            obj_meta,
+            window_size,
+        ))
+    }
+
+    /// [`Self::get_streaming_storage_reader`] for a caller that reads the file
+    /// from its start, such as a log file's block walk.
+    ///
+    /// The first window is fetched here, by range, and the response also says
+    /// how large the file is, which saves the size lookup the other open starts
+    /// with. A read the store refuses (an empty file has no byte 0) falls back to
+    /// that lookup. A caller that starts elsewhere, such as an HFile's trailer,
+    /// would pay for a window it does not read, and uses the other open.
+    pub async fn get_streaming_storage_reader_from_start(
+        &self,
+        relative_path: &str,
+    ) -> Result<StorageReader> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
             .map_err(StorageError::ReaderError)?;
-        // The first window, asked for by range, also says how large the file is,
-        // so the size lookup a streaming read otherwise starts with is one round
-        // trip saved. A read the store refuses (an empty file has no byte 0) falls
-        // back to that lookup.
         let first = object_store::GetOptions {
             range: Some(object_store::GetRange::Bounded(0..window_size)),
             ..Default::default()
@@ -464,12 +486,7 @@ impl Storage {
                 ));
             }
         }
-        let obj_meta = obj_store.head(&obj_path).await?;
-        Ok(StorageReader::new_streaming(
-            obj_store,
-            obj_meta,
-            window_size,
-        ))
+        self.get_streaming_storage_reader(relative_path).await
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
