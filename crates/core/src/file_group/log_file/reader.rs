@@ -108,7 +108,9 @@ impl LogFileReader {
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let reader = storage.get_streaming_storage_reader(relative_path).await?;
+        let reader = storage
+            .get_streaming_storage_reader_from_start(relative_path)
+            .await?;
         let timezone: String = hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
