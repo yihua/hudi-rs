@@ -676,11 +676,7 @@ impl HoodieFileGroupReader {
                     Some(output) if unfiltered => unneeded
                         .into_iter()
                         .filter(|c| output.column_with_name(c).is_none())
-                        .filter(|c| {
-                            merge_schema
-                                .field_with_name(c)
-                                .is_ok_and(can_stand_in)
-                        })
+                        .filter(|c| merge_schema.field_with_name(c).is_ok_and(can_stand_in))
                         .collect(),
                     _ => Vec::new(),
                 };

@@ -1601,9 +1601,7 @@ mod tests {
             base_instant_of_positions,
             "20240101000001000",
         );
-        if partial
-            && let LogBlockContent::Records(records) = &mut update.content
-        {
+        if partial && let LogBlockContent::Records(records) = &mut update.content {
             for batch in records.data_batches.iter_mut() {
                 let mut metadata = batch.schema().metadata().clone();
                 metadata.insert(PARTIAL_UPDATE_SCHEMA_KEY.to_string(), "true".to_string());
@@ -1660,6 +1658,11 @@ mod tests {
         merge_ten_rows(buffer, blocks).0
     }
 
+    /// Whether `buffer` still needs the record key from the base file.
+    fn reads_key(buffer: &mut dyn HoodieFileGroupRecordBuffer) -> bool {
+        buffer.base_columns_unneeded(&schema()).unwrap().is_empty()
+    }
+
     /// Each case where the direct merge does not apply falls back on its own,
     /// returns what the key merge returns, and reads the record key from the
     /// base file again. The direct case, for contrast, does without it.
@@ -1681,56 +1684,55 @@ mod tests {
         let direct = build_buffer();
         assert!(direct.direct.is_some());
         let (out, mut direct) = merge_ten_rows(direct, fallback_blocks(BASE_INSTANT, false));
+        let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, false));
         assert_eq!(out, expected);
-        assert_eq!(out, key_merged(commit, &[], fallback_blocks(BASE_INSTANT, false)));
+        assert_eq!(out, reference);
         assert!(direct.direct.is_some());
-        assert_eq!(
-            direct.base_columns_unneeded(&schema()).unwrap(),
-            vec!["_hoodie_record_key".to_string()]
-        );
+        assert!(!reads_key(&mut direct));
 
-        // No record positions in the blocks: the empty bitmap falls back to
+        // No record positions in the block: the empty bitmap falls back to
         // the key merge.
         let mut no_positions = build_buffer();
         let mut update = data_block_with_positions(&[("k2", 200, 9)], &[], BASE_INSTANT);
         no_positions.process_data_block(&mut update).unwrap();
         assert!(no_positions.direct.is_none());
         assert_eq!(no_positions.get_buffer_type(), BufferType::KeyBasedMerge);
-        assert!(no_positions.base_columns_unneeded(&schema()).unwrap().is_empty());
+        assert!(reads_key(&mut no_positions));
 
         // Positions computed against another base file.
         let other = "19990101000000000";
         let (out, mut mismatched) = merge_ten_rows(build_buffer(), fallback_blocks(other, false));
+        let reference = key_merged(commit, &[], fallback_blocks(other, false));
         assert!(mismatched.direct.is_none());
         assert_eq!(mismatched.get_buffer_type(), BufferType::KeyBasedMerge);
         assert_eq!(out, expected);
-        assert_eq!(out, key_merged(commit, &[], fallback_blocks(other, false)));
-        assert!(mismatched.base_columns_unneeded(&schema()).unwrap().is_empty());
+        assert_eq!(out, reference);
+        assert!(reads_key(&mut mismatched));
 
         // A partial-update block: still merged by position, through the map.
-        let (out, mut partial) = merge_ten_rows(build_buffer(), fallback_blocks(BASE_INSTANT, true));
+        let blocks = fallback_blocks(BASE_INSTANT, true);
+        let (out, mut partial) = merge_ten_rows(build_buffer(), blocks);
+        let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, true));
         assert!(partial.direct.is_none());
         assert_eq!(partial.get_buffer_type(), BufferType::PositionBasedMerge);
-        assert_eq!(out, key_merged(commit, &[], fallback_blocks(BASE_INSTANT, true)));
-        assert!(partial.base_columns_unneeded(&schema()).unwrap().is_empty());
+        assert_eq!(out, reference);
+        assert!(reads_key(&mut partial));
 
         // Event-time ordering never starts the direct merge.
         let event = "EVENT_TIME_ORDERING";
         let ordering = [("hoodie.table.ordering.fields", "ts")];
         let event_buffer = build_buffer_with(event, &ordering, &[]);
         assert!(event_buffer.direct.is_none());
-        let (out, mut event_buffer) =
-            merge_ten_rows(event_buffer, fallback_blocks(BASE_INSTANT, false));
-        assert_eq!(out, key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false)));
-        assert!(event_buffer.base_columns_unneeded(&schema()).unwrap().is_empty());
+        let blocks = fallback_blocks(BASE_INSTANT, false);
+        let (out, mut event_buffer) = merge_ten_rows(event_buffer, blocks);
+        let reference = key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false));
+        assert_eq!(out, reference);
+        assert!(reads_key(&mut event_buffer));
 
         // `hoodie.merge.use.record.positions=false` builds a key-based buffer,
         // which needs every merge column from the base file.
-        let mut ctx = ReaderContext::empty();
-        ctx.rebuild_record_context(String::new());
-        let mut key_buffer =
-            KeyBasedFileGroupRecordBuffer::new(Arc::new(ctx), commit.to_string(), false).unwrap();
-        assert!(key_buffer.base_columns_unneeded(&schema()).unwrap().is_empty());
+        let mut key_buffer = build_buffer().inner;
+        assert!(reads_key(&mut key_buffer));
     }
 
     /// An update whose base row the base read never produces is emitted once
