@@ -756,8 +756,8 @@ mod tests {
         );
         assert_eq!(
             (gets, heads),
-            (1, 1),
-            "one window fill and the size lookup, and nothing else"
+            (1, 0),
+            "one window fill, which also sizes the file, and nothing else"
         );
 
         // Smaller than the file: the walk cannot hold the content, so blocks defer
