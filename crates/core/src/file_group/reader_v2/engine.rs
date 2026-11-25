@@ -145,7 +145,7 @@ pub struct HoodieFileGroupReader {
     /// read defers opening its parquet base file until the scan is done, with
     /// the file's size. Taken by the open; `None` there means the open fetches
     /// it.
-    prefetched_base_footer: Option<(Arc<ParquetMetaData>, u64)>,
+    prefetched_base_footer: Option<BaseFooter>,
 
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
@@ -157,6 +157,10 @@ pub struct HoodieFileGroupReader {
     // (CoW || mor_pk_safe) lives at the use sites; this file's gate is at
     // `base_file_source` below.
 }
+
+/// A parquet base file's footer and the file's size, fetched before it is
+/// opened.
+type BaseFooter = (Arc<ParquetMetaData>, u64);
 
 /// Rows per base batch handed to the merge, and therefore per merged chunk.
 ///
@@ -593,7 +597,7 @@ impl HoodieFileGroupReader {
     /// reporting whatever goes wrong there.
     fn base_footer_prefetch(
         &self,
-    ) -> Option<futures::future::BoxFuture<'static, Option<(Arc<ParquetMetaData>, u64)>>> {
+    ) -> Option<futures::future::BoxFuture<'static, Option<BaseFooter>>> {
         let path = self.input_split.base_file_path.clone()?;
         if !crate::file_group::reader_v2::buffer::loader::base_file_is_parquet(
             &self.reader_context.base_file_format,
