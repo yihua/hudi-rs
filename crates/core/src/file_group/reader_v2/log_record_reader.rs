@@ -51,6 +51,12 @@ use crate::timeline::selector::InstantRange;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
+
+/// Log files of one slice walked at once. Each walk holds at most one fetch
+/// window, so this bounds the scan's transient memory to this many windows.
+const LOG_FILE_WALK_CONCURRENCY: usize = 4;
+
 // =========================================================================
 // Pass 1 result
 // =========================================================================
@@ -508,33 +514,49 @@ impl BaseHoodieLogRecordReader {
         // only the deferred remainder. Sharing one budget across every log file is
         // what keeps peak residency at one window, which is the bound the
         // headers-only walk exists to buy.
-        let mut resident_budget =
+        let resident_budget =
             crate::storage::reader::stream_window_size(&hudi_configs).unwrap_or(0);
         profile_once!(self.log_block_read_us, {
-            for path in &self.log_file_paths.clone() {
-                // Walk headers only, out of a bounded fetch window. Passes 1 and 2
-                // read nothing but a block's header, so the gates below decide what
-                // is admitted before any content is fetched or decoded, and Pass 3
-                // reads each admitted block's own content. A block the gates discard
-                // therefore costs no bytes and cannot fail the read by being
-                // undecodable. No instant range is applied here: the gates decide,
-                // rather than filtering twice with different rules.
-                let mut reader =
-                    LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
-                        .await?;
-                let blocks = reader
-                    .read_all_blocks_metadata_only(&mut resident_budget)
-                    .await?;
+            // Walk headers only, out of a bounded fetch window. Passes 1 and 2
+            // read nothing but a block's header, so the gates below decide what is
+            // admitted before any content is fetched or decoded, and Pass 3 reads
+            // each admitted block's own content. A block the gates discard
+            // therefore costs no bytes and cannot fail the read by being
+            // undecodable. No instant range is applied here: the gates decide,
+            // rather than filtering twice with different rules.
+            //
+            // The files are walked concurrently, a few at a time, so a slice's log
+            // GETs overlap instead of queueing; `buffered` keeps their order. The
+            // resident budget is split evenly across the files, which keeps the
+            // content held from the walk within one window in total.
+            let paths = self.log_file_paths.clone();
+            let per_file_budget = resident_budget / (paths.len().max(1) as u64);
+            let walks = paths.iter().map(|path| {
+                let hudi_configs = hudi_configs.clone();
+                let storage = self.storage.clone();
+                async move {
+                    let mut reader =
+                        LogFileReader::new_streaming(hudi_configs, storage, path).await?;
+                    let mut budget = per_file_budget;
+                    let blocks = reader.read_all_blocks_metadata_only(&mut budget).await?;
+                    // A file inside one fetch window costs a single request whose
+                    // blocking read can complete before this task is ever
+                    // suspended, and Pass 3 then decodes resident bytes with no
+                    // I/O at all, so nothing in the scan is guaranteed to reach
+                    // the scheduler. On a single-worker runtime that starves every
+                    // task sharing it for the whole scan; one explicit yield per
+                    // file keeps the walk cooperative whatever the I/O timing.
+                    tokio::task::yield_now().await;
+                    Ok::<_, crate::error::CoreError>(blocks)
+                }
+            });
+            let walked: Vec<Vec<LogBlock>> = futures::stream::iter(walks)
+                .buffered(LOG_FILE_WALK_CONCURRENCY)
+                .try_collect()
+                .await?;
+            for blocks in walked {
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
-                // A file inside one fetch window costs a single request whose
-                // blocking read can complete before this task is ever suspended,
-                // and Pass 3 then decodes resident bytes with no I/O at all — so
-                // nothing in the scan is guaranteed to reach the scheduler. On a
-                // single-worker runtime that starves every task sharing it for
-                // the whole scan; one explicit yield per file keeps the walk
-                // cooperative whatever the I/O timing.
-                tokio::task::yield_now().await;
             }
         });
 
