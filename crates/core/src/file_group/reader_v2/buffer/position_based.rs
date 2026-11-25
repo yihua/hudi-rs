@@ -758,9 +758,10 @@ impl PositionBasedFileGroupRecordBuffer {
 /// ordering (the newest log record wins whole), no partial-update rule, deletes
 /// marked only by delete blocks or `_hoodie_is_deleted`, and no emitted deletes.
 fn direct_merge_applies(inner: &KeyBasedFileGroupRecordBuffer, emit_delete: bool) -> bool {
-    let delete_markers_ok = inner.base.delete_context.as_ref().is_none_or(|ctx| {
-        ctx.custom_delete_marker.is_none() && ctx.hoodie_operation_pos.is_none()
-    });
+    let delete_markers_ok =
+        inner.base.delete_context.as_ref().is_none_or(|ctx| {
+            ctx.custom_delete_marker.is_none() && ctx.hoodie_operation_pos.is_none()
+        });
     !emit_delete
         && inner.base.record_merge_mode == "COMMIT_TIME_ORDERING"
         && !inner.has_partial_update_rules()
@@ -836,9 +837,11 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             if rows != positions.len() {
                 return Err(record_count_mismatch("data", rows, positions.len()));
             }
-            let partial = batches
-                .iter()
-                .any(|b| b.schema().metadata().contains_key(PARTIAL_UPDATE_SCHEMA_KEY));
+            let partial = batches.iter().any(|b| {
+                b.schema()
+                    .metadata()
+                    .contains_key(PARTIAL_UPDATE_SCHEMA_KEY)
+            });
             if partial {
                 self.leave_direct()?;
             }
@@ -1560,7 +1563,10 @@ mod tests {
         assert_eq!(direct, run(MergeWay::PositionMap));
         assert_eq!(direct, run(MergeWay::RecordKey));
         assert_eq!(direct.len(), 18, "positions 2 and 5 are deleted");
-        assert!(direct.contains(&("k7".to_string(), 777, 9)), "the later update wins");
+        assert!(
+            direct.contains(&("k7".to_string(), 777, 9)),
+            "the later update wins"
+        );
         assert!(direct.contains(&("k12".to_string(), 1200, 9)));
         assert!(!direct.iter().any(|(k, _, _)| k == "k2" || k == "k5"));
     }
@@ -1594,7 +1600,10 @@ mod tests {
         let mut tiny = build_buffer_with_reader_config(&[(CONFIG_MERGE_MAX_SIZE, "1")]);
         let mut block = data_block_with_positions(&[("k1", 100, 9)], &[1], BASE_INSTANT);
         tiny.process_data_block(&mut block).unwrap();
-        assert!(tiny.direct.is_none(), "past the budget the blocks go to the map");
+        assert!(
+            tiny.direct.is_none(),
+            "past the budget the blocks go to the map"
+        );
         assert_eq!(tiny.size(), 1);
     }
 
