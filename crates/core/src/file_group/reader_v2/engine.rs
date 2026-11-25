@@ -212,6 +212,52 @@ impl BaseSource {
     }
 }
 
+/// Whether a merge column can be left unread from the base file: a nullable
+/// column is filled with nulls, a non-nullable string column with empty
+/// strings. Either stands in only for a column nothing downstream reads.
+fn can_stand_in(field: &arrow_schema::Field) -> bool {
+    field.is_nullable()
+        || matches!(
+            field.data_type(),
+            arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8
+        )
+}
+
+/// `batch` in `schema`, with each `skipped` column replaced by its stand-in:
+/// nulls when the field is nullable, empty strings when it is a non-nullable
+/// string.
+fn stand_in_columns(
+    batch: &arrow_array::RecordBatch,
+    schema: &SchemaRef,
+    skipped: &[String],
+) -> Result<arrow_array::RecordBatch> {
+    let rows = batch.num_rows();
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| -> arrow_array::ArrayRef {
+            if !skipped.iter().any(|c| c == f.name()) || f.is_nullable() {
+                return batch.column(i).clone();
+            }
+            match f.data_type() {
+                arrow_schema::DataType::LargeUtf8 => Arc::new(arrow_array::LargeStringArray::new(
+                    arrow_buffer::OffsetBuffer::new_zeroed(rows),
+                    arrow_buffer::Buffer::from_vec(Vec::<u8>::new()),
+                    None,
+                )),
+                _ => Arc::new(arrow_array::StringArray::new(
+                    arrow_buffer::OffsetBuffer::new_zeroed(rows),
+                    arrow_buffer::Buffer::from_vec(Vec::<u8>::new()),
+                    None,
+                )),
+            }
+        })
+        .collect();
+    arrow_array::RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| CoreError::ReadFileSliceError(format!("base column stand-in failed: {e}")))
+}
+
 /// `schema` without the internal row-position column.
 ///
 /// The column belongs to the base read and the position buffer; it is not the
@@ -632,7 +678,7 @@ impl HoodieFileGroupReader {
                         .filter(|c| {
                             merge_schema
                                 .field_with_name(c)
-                                .is_ok_and(|f| f.is_nullable())
+                                .is_ok_and(|f| can_stand_in(f.as_ref()))
                         })
                         .collect(),
                     _ => Vec::new(),
@@ -1139,10 +1185,37 @@ impl HoodieFileGroupReader {
                 }
             })?;
 
-        let evolve_to = base_read_schema.clone();
+        // A column left unread is evolved as nullable, then replaced by a
+        // stand-in that satisfies its real nullability (see `stand_in_columns`).
+        let skipped = self.skip_base_columns.clone();
+        let evolve_to = if skipped.is_empty() {
+            base_read_schema.clone()
+        } else {
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                base_read_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if skipped.iter().any(|c| c == f.name()) {
+                            Arc::new(f.as_ref().clone().with_nullable(true))
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                base_read_schema.metadata().clone(),
+            ))
+        };
+        let read_schema = base_read_schema.clone();
         let evolved = futures::StreamExt::map(base_stream.into_stream(), move |b| match b {
             Ok(batch) => {
-                crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                let batch =
+                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)?;
+                if skipped.is_empty() {
+                    Ok(batch)
+                } else {
+                    stand_in_columns(&batch, &read_schema, &skipped)
+                }
             }
             Err(e) => Err(CoreError::from(e)),
         });

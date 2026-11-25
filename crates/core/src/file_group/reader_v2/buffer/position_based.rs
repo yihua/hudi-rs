@@ -70,12 +70,12 @@ use arrow_schema::SchemaRef;
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
 use crate::file_group::log_file::log_block::{LogBlock, LogBlockContent};
 use crate::file_group::reader_v2::buffer::key_based::{BaseMatch, KeyBasedFileGroupRecordBuffer};
 use crate::file_group::reader_v2::buffer::record_positions::{
     base_row_position_array, decode_record_positions,
 };
-use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
 use crate::file_group::reader_v2::buffer::row_extraction::{
     reconcile_batch_to_schema, records_to_batch,
 };
