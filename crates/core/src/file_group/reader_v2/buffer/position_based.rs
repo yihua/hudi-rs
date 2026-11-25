@@ -1250,7 +1250,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn merges_base_by_position(&mut self, merge_schema: &SchemaRef) -> Result<bool> {
-        Ok(self.should_use_position && self.build_direct_index(merge_schema)?)
+        Ok(self.should_use_position && self.build_position_merge_index(merge_schema)?)
     }
 
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
