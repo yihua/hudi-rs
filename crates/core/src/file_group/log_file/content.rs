@@ -189,6 +189,9 @@ pub struct Decoder {
     /// Schema an Avro block is resolved up to, as Avro JSON. See
     /// [`Decoder::with_reader_schema`].
     reader_schema_json: Option<String>,
+    /// Columns a full Avro block is decoded to when no reader schema is set.
+    /// See [`Decoder::with_projection`].
+    projection: Option<Arc<Vec<String>>>,
     /// Whether an HFile block's records are decoded into Arrow batches rather
     /// than handed back as key-value pairs. See
     /// [`Decoder::with_hfile_as_records`].
@@ -290,6 +293,15 @@ impl Decoder {
         self
     }
 
+    /// Decode a full Avro block to only these columns when no reader schema is
+    /// set: the block's own schema, narrowed to them, becomes the reader
+    /// schema, so Avro resolution steps over the other fields instead of
+    /// building arrays for them. A partial block is still decoded whole.
+    pub fn with_projection(mut self, projection: Option<Arc<Vec<String>>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
     pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             batch_size: 1024,
@@ -297,6 +309,7 @@ impl Decoder {
             row_filter: None,
             repair_table_schema: None,
             reader_schema_json: None,
+            projection: None,
             hfile_as_records: false,
             key_predicate: None,
             registered: std::cell::RefCell::new(None),
@@ -386,10 +399,14 @@ impl Decoder {
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
+        let narrowed = match (&self.reader_schema_json, &self.projection) {
+            (None, Some(columns)) if !is_partial => narrow_avro_record(writer_schema_json, columns)?,
+            _ => None,
+        };
         let reader_schema_json = if is_partial {
             None
         } else {
-            self.reader_schema_json.as_deref()
+            self.reader_schema_json.as_deref().or(narrowed.as_deref())
         };
         // Avro resolves what it defines as a promotion; Hudi permits more than
         // that (a number, or anything with a logical type, to string) and Avro
@@ -737,6 +754,28 @@ impl Decoder {
 
         Ok(records)
     }
+}
+
+/// `writer_schema_json`, a top-level Avro record, with its fields narrowed to
+/// `columns`, or `None` when that would keep every field. Field order and types
+/// are the writer's, so resolving against it changes nothing but which fields
+/// are materialized.
+fn narrow_avro_record(writer_schema_json: &str, columns: &[String]) -> Result<Option<String>> {
+    let mut schema: serde_json::Value = serde_json::from_str(writer_schema_json)
+        .map_err(|e| CoreError::LogBlockError(format!("log block schema is not JSON: {e}")))?;
+    let Some(fields) = schema.get_mut("fields").and_then(|f| f.as_array_mut()) else {
+        return Ok(None);
+    };
+    let before = fields.len();
+    fields.retain(|f| {
+        f.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| columns.iter().any(|c| c == n))
+    });
+    if fields.len() == before {
+        return Ok(None);
+    }
+    Ok(Some(schema.to_string()))
 }
 
 #[cfg(test)]

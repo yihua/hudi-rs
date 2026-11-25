@@ -59,6 +59,9 @@ pub struct LogFileReader {
     /// Schema Avro blocks are resolved up to. Unset by default, so a caller that
     /// has none reads each block at the schema it was written with.
     reader_schema_json: Option<String>,
+    /// Columns full Avro blocks are decoded to when there is no reader schema.
+    /// Unset by default, so every column is decoded.
+    projection: Option<Arc<Vec<String>>>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -91,6 +94,7 @@ impl LogFileReader {
             row_filter: None,
             key_predicate: None,
             reader_schema_json: None,
+            projection: None,
         })
     }
 
@@ -115,6 +119,7 @@ impl LogFileReader {
             row_filter: None,
             key_predicate: None,
             reader_schema_json: None,
+            projection: None,
         })
     }
 
@@ -210,6 +215,13 @@ impl LogFileReader {
     /// `Decoder::with_reader_schema`.
     pub fn with_reader_schema(mut self, reader_schema_json: Option<String>) -> Self {
         self.reader_schema_json = reader_schema_json;
+        self
+    }
+
+    /// Decode full Avro blocks to only these columns. See
+    /// `Decoder::with_projection`.
+    pub fn with_projection(mut self, projection: Option<Arc<Vec<String>>>) -> Self {
+        self.projection = projection;
         self
     }
 
@@ -595,7 +607,8 @@ impl LogFileReader {
         let decoder = Decoder::new(self.hudi_configs.clone())
             .with_row_filter(self.row_filter.clone())
             .with_key_predicate(self.key_predicate.clone())
-            .with_reader_schema(self.reader_schema_json.clone());
+            .with_reader_schema(self.reader_schema_json.clone())
+            .with_projection(self.projection.clone());
         // Decode out of the block's own remaining bytes rather than straight off
         // the reader: the reader is async and the decoders are not. The span
         // ends where the block does, so a content length that lies runs out of
