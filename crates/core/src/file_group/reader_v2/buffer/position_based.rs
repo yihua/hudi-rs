@@ -1260,8 +1260,20 @@ mod tests {
     fn build_buffer_with_reader_config(
         reader_config: &[(&str, &str)],
     ) -> PositionBasedFileGroupRecordBuffer {
-        let merge_mode = "COMMIT_TIME_ORDERING";
+        build_buffer_with("COMMIT_TIME_ORDERING", &[], reader_config)
+    }
+
+    /// Build a buffer under `merge_mode`, with extra table-config and reader-config
+    /// entries.
+    fn build_buffer_with(
+        merge_mode: &str,
+        table_config: &[(&str, &str)],
+        reader_config: &[(&str, &str)],
+    ) -> PositionBasedFileGroupRecordBuffer {
         let mut ctx = ReaderContext::empty();
+        for (k, v) in table_config {
+            ctx.table_config.insert((*k).to_string(), (*v).to_string());
+        }
         for (k, v) in reader_config {
             ctx.hoodie_reader_config
                 .insert((*k).to_string(), (*v).to_string());
@@ -1578,6 +1590,147 @@ mod tests {
         );
         assert!(direct.contains(&("k12".to_string(), 1200, 9)));
         assert!(!direct.iter().any(|(k, _, _)| k == "k2" || k == "k5"));
+    }
+
+    /// A data block that would reach the direct merge in each fallback case
+    /// below: it updates position 2 and is followed by a delete of position 5.
+    fn fallback_blocks(base_instant_of_positions: &str, partial: bool) -> (LogBlock, LogBlock) {
+        let mut update = data_block_with_positions_at_instant(
+            &[("k2", 200, 9)],
+            &[2],
+            base_instant_of_positions,
+            "20240101000001000",
+        );
+        if partial
+            && let LogBlockContent::Records(records) = &mut update.content
+        {
+            for batch in records.data_batches.iter_mut() {
+                let mut metadata = batch.schema().metadata().clone();
+                metadata.insert(PARTIAL_UPDATE_SCHEMA_KEY.to_string(), "true".to_string());
+                let schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
+                *batch = batch.clone().with_schema(schema).unwrap();
+            }
+        }
+        let delete = delete_block_with_positions(&["k5"], &[5], base_instant_of_positions);
+        (update, delete)
+    }
+
+    /// Merge `blocks` into a 10-row base through `buffer`'s batch path and
+    /// return the sorted rows.
+    fn merge_ten_rows(
+        mut buffer: PositionBasedFileGroupRecordBuffer,
+        blocks: (LogBlock, LogBlock),
+    ) -> (Vec<(String, i32, i64)>, PositionBasedFileGroupRecordBuffer) {
+        let (mut update, mut delete) = blocks;
+        buffer.process_data_block(&mut update).unwrap();
+        buffer.process_delete_block(&mut delete).unwrap();
+        let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
+        let rows: Vec<(&str, i32, i64)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i as i32, 1))
+            .collect();
+        let target = schema();
+        let mut all = Vec::new();
+        if let Some(out) = buffer
+            .merge_base_batch(&base_batch_at(&rows, 0), &target)
+            .unwrap()
+        {
+            all.push(out);
+        }
+        while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+            all.push(b);
+        }
+        let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+        let mut out = extract(&merged);
+        out.sort();
+        (out, buffer)
+    }
+
+    /// The same blocks merged by record key, the reference every fallback must
+    /// match.
+    fn key_merged(
+        merge_mode: &str,
+        table_config: &[(&str, &str)],
+        blocks: (LogBlock, LogBlock),
+    ) -> Vec<(String, i32, i64)> {
+        let mut buffer = build_buffer_with(merge_mode, table_config, &[]);
+        buffer.direct = None;
+        buffer.fallback_to_key_based().unwrap();
+        merge_ten_rows(buffer, blocks).0
+    }
+
+    /// Each case where the direct merge does not apply falls back on its own,
+    /// returns what the key merge returns, and reads the record key from the
+    /// base file again. The direct case, for contrast, does without it.
+    #[test]
+    fn direct_merge_falls_back_where_it_does_not_apply() {
+        let expected: Vec<(String, i32, i64)> = (0..10)
+            .filter(|i| *i != 5)
+            .map(|i| {
+                if i == 2 {
+                    ("k2".to_string(), 200, 9)
+                } else {
+                    (format!("k{i}"), i, 1)
+                }
+            })
+            .collect();
+        let commit = "COMMIT_TIME_ORDERING";
+
+        // Direct: positions match the base instant.
+        let direct = build_buffer();
+        assert!(direct.direct.is_some());
+        let (out, mut direct) = merge_ten_rows(direct, fallback_blocks(BASE_INSTANT, false));
+        assert_eq!(out, expected);
+        assert_eq!(out, key_merged(commit, &[], fallback_blocks(BASE_INSTANT, false)));
+        assert!(direct.direct.is_some());
+        assert_eq!(
+            direct.base_columns_unneeded(&schema()).unwrap(),
+            vec!["_hoodie_record_key".to_string()]
+        );
+
+        // No record positions in the blocks: the empty bitmap falls back to
+        // the key merge.
+        let mut no_positions = build_buffer();
+        let mut update = data_block_with_positions(&[("k2", 200, 9)], &[], BASE_INSTANT);
+        no_positions.process_data_block(&mut update).unwrap();
+        assert!(no_positions.direct.is_none());
+        assert_eq!(no_positions.get_buffer_type(), BufferType::KeyBasedMerge);
+        assert!(no_positions.base_columns_unneeded(&schema()).unwrap().is_empty());
+
+        // Positions computed against another base file.
+        let other = "19990101000000000";
+        let (out, mut mismatched) = merge_ten_rows(build_buffer(), fallback_blocks(other, false));
+        assert!(mismatched.direct.is_none());
+        assert_eq!(mismatched.get_buffer_type(), BufferType::KeyBasedMerge);
+        assert_eq!(out, expected);
+        assert_eq!(out, key_merged(commit, &[], fallback_blocks(other, false)));
+        assert!(mismatched.base_columns_unneeded(&schema()).unwrap().is_empty());
+
+        // A partial-update block: still merged by position, through the map.
+        let (out, mut partial) = merge_ten_rows(build_buffer(), fallback_blocks(BASE_INSTANT, true));
+        assert!(partial.direct.is_none());
+        assert_eq!(partial.get_buffer_type(), BufferType::PositionBasedMerge);
+        assert_eq!(out, key_merged(commit, &[], fallback_blocks(BASE_INSTANT, true)));
+        assert!(partial.base_columns_unneeded(&schema()).unwrap().is_empty());
+
+        // Event-time ordering never starts the direct merge.
+        let event = "EVENT_TIME_ORDERING";
+        let ordering = [("hoodie.table.ordering.fields", "ts")];
+        let event_buffer = build_buffer_with(event, &ordering, &[]);
+        assert!(event_buffer.direct.is_none());
+        let (out, mut event_buffer) =
+            merge_ten_rows(event_buffer, fallback_blocks(BASE_INSTANT, false));
+        assert_eq!(out, key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false)));
+        assert!(event_buffer.base_columns_unneeded(&schema()).unwrap().is_empty());
+
+        // `hoodie.merge.use.record.positions=false` builds a key-based buffer,
+        // which needs every merge column from the base file.
+        let mut ctx = ReaderContext::empty();
+        ctx.rebuild_record_context(String::new());
+        let mut key_buffer =
+            KeyBasedFileGroupRecordBuffer::new(Arc::new(ctx), commit.to_string(), false).unwrap();
+        assert!(key_buffer.base_columns_unneeded(&schema()).unwrap().is_empty());
     }
 
     /// An update whose base row the base read never produces is emitted once
