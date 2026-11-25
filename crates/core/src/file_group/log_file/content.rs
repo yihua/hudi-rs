@@ -175,6 +175,9 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
+/// The most rows an Avro data block is decoded into per batch.
+const AVRO_DATA_BATCH_ROWS_MAX: usize = 65_536;
+
 /// What an Avro block's decoder is built from, besides the decoder itself.
 struct AvroBlockSetup {
     registered: RegisteredWriterSchema,
@@ -237,10 +240,6 @@ pub struct Decoder {
     /// Columns a full Avro block is decoded to when no reader schema is set.
     /// See [`Decoder::with_projection`].
     projection: Option<Arc<Vec<String>>>,
-    /// The last writer schema narrowed to `projection`, and the result: `None`
-    /// when narrowing would drop nothing or could not produce a valid schema.
-    /// One entry, like `registered`.
-    narrowed: std::cell::RefCell<Option<(String, Option<Arc<str>>)>>,
     /// Whether an HFile block's records are decoded into Arrow batches rather
     /// than handed back as key-value pairs. See
     /// [`Decoder::with_hfile_as_records`].
@@ -348,7 +347,6 @@ impl Decoder {
             repair_table_schema: None,
             reader_schema_json: None,
             projection: None,
-            narrowed: std::cell::RefCell::new(None),
             hfile_as_records: false,
             key_predicate: None,
         }
@@ -424,6 +422,7 @@ impl Decoder {
         writer_schema_json: &str,
         header: &HashMap<BlockMetadataKey, String>,
         narrow: bool,
+        batch_rows: usize,
     ) -> Result<AvroBlockDecoder> {
         // A partial-update block carries only the columns that were written, and
         // the merge needs to know which those are. Resolving it up to the table
@@ -438,11 +437,11 @@ impl Decoder {
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
-        let setup = self.avro_block_setup(writer_schema_json, is_partial)?;
+        let setup = self.avro_block_setup(writer_schema_json, is_partial, narrow)?;
         let mut decoder = AvroBlockDecoder::try_new_with_registered(
             &setup.registered,
             setup.reader_schema_json.as_deref(),
-            self.batch_size,
+            batch_rows,
         )?;
         if let Some(rewrite_to) = &setup.rewrite_to {
             decoder = decoder.with_rewrite_to(rewrite_to.clone());
@@ -459,20 +458,24 @@ impl Decoder {
         &self,
         writer_schema_json: &str,
         is_partial: bool,
+        narrow: bool,
     ) -> Result<Arc<AvroBlockSetup>> {
+        let narrow = narrow && !is_partial && self.reader_schema_json.is_none();
         let key = AvroBlockSetupKey {
             writer_schema_json: writer_schema_json.to_string(),
             reader_schema_json: self.reader_schema_json.clone(),
-            projection: self.projection.as_deref().cloned(),
+            projection: if narrow {
+                self.projection.as_deref().cloned()
+            } else {
+                None
+            },
             is_partial,
         };
         if let Some(found) = lock_setups().get(&key) {
             return Ok(found.clone());
         }
-        let narrowed = match (&self.reader_schema_json, &self.projection) {
-            (None, Some(columns)) if narrow && !is_partial => {
-                self.narrowed_for(writer_schema_json, columns)
-            }
+        let narrowed = match &self.projection {
+            Some(columns) if narrow => narrow_avro_record(writer_schema_json, columns),
             _ => None,
         };
         let reader_schema_json = if is_partial {
@@ -519,20 +522,6 @@ impl Decoder {
         Ok(setup)
     }
 
-    /// `writer_schema_json` narrowed to `columns`, computed once per writer
-    /// schema.
-    fn narrowed_for(&self, writer_schema_json: &str, columns: &[String]) -> Option<Arc<str>> {
-        let mut slot = self.narrowed.borrow_mut();
-        if let Some((json, narrowed)) = slot.as_ref()
-            && json == writer_schema_json
-        {
-            return narrowed.clone();
-        }
-        let narrowed = narrow_avro_record(writer_schema_json, columns).map(Arc::from);
-        *slot = Some((writer_schema_json.to_string(), narrowed.clone()));
-        narrowed
-    }
-
     /// An HFile block, in whichever shape the caller asked for.
     ///
     /// The records are Avro-encoded values under HFile keys, so decoding them to
@@ -555,7 +544,8 @@ impl Decoder {
                     .to_string(),
             )
         })?;
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header, false)?;
+        let mut decoder =
+            self.avro_decoder_for(writer_schema_json, header, false, self.batch_size)?;
         let mut decoded: Vec<arrow_array::RecordBatch> = Vec::new();
         for record in &records {
             if let Some(batch) = decoder.decode(&record.value)? {
@@ -622,9 +612,15 @@ impl Decoder {
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header, true)?;
+        // The block says how many records it holds, so it is decoded in batches
+        // of up to that many rather than `batch_size`: the decoder is rebuilt
+        // after every full batch (see `AvroBlockDecoder::decode`), and at
+        // `batch_size` rows a block of tens of thousands of records spent more
+        // time rebuilding it than decoding some of its columns.
+        let batch_rows = (record_count as usize).clamp(1, AVRO_DATA_BATCH_ROWS_MAX);
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, true, batch_rows)?;
         let mut batches =
-            RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
+            RecordBatches::new_with_capacity(record_count as usize / batch_rows + 1, 0);
 
         // Each datum is framed by Hudi with a four-byte length, so the bodies
         // are read here and handed over one at a time.
