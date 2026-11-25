@@ -1050,6 +1050,15 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             .merge_one_base_batch_kernel(base, target_schema, base_match)
     }
 
+    /// The direct merge matches base rows by position alone, so it needs no
+    /// record key from the base file.
+    fn base_columns_unneeded(&mut self, merge_schema: &SchemaRef) -> Result<Vec<String>> {
+        if self.should_use_position && self.build_direct_index(merge_schema)? {
+            return Ok(self.inner.record_context.record_key_fields.clone());
+        }
+        Ok(Vec::new())
+    }
+
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
         if self.direct.is_some() {
             return self.direct_drain(target_schema);

@@ -127,6 +127,11 @@ pub struct HoodieFileGroupReader {
     /// Valid block instants from log scanning.
     valid_block_instants: Vec<String>,
 
+    /// Columns of the merge schema left unread from the base file (and
+    /// null-filled) because neither the merge nor the output needs them. Set
+    /// after the log scan, before a merging read opens the base file.
+    skip_base_columns: Vec<String>,
+
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
@@ -391,6 +396,7 @@ impl HoodieFileGroupReader {
             read_stats: HoodieReadStats::default(),
             stream_stats: new_stream_stats_handle(),
             valid_block_instants: Vec::new(),
+            skip_base_columns: Vec::new(),
             buffered_record_converter: None,
         })
     }
@@ -448,7 +454,14 @@ impl HoodieFileGroupReader {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         // Stage timing (perf harness): opening the base file. Only the open —
         // the per-row-group decode is paid lazily, inside the merge.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        let base = if self.defers_base_open() {
+            None
+        } else {
+            Some(profile_once!(
+                self.read_stats.base_read_us,
+                self.base_file_source().await
+            )?)
+        };
         Ok(self.init_record_iterators(base).await?.into_stream())
     }
 
@@ -463,7 +476,14 @@ impl HoodieFileGroupReader {
         // Stage timing (perf harness): only the open, same as `open_stream` —
         // the decode happens lazily while `collect_into_one_batch` drives the
         // stream, so it lands in the merge loop rather than in `base_read_us`.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        let base = if self.defers_base_open() {
+            None
+        } else {
+            Some(profile_once!(
+                self.read_stats.base_read_us,
+                self.base_file_source().await
+            )?)
+        };
         let batch = self
             .init_record_iterators(base)
             .await?
@@ -505,7 +525,19 @@ impl HoodieFileGroupReader {
     ///   └─ recordBufferLoader.getRecordBuffer(...)
     ///        → FileGroupMergeStream::new_buffered(...)
     /// ```
-    async fn init_record_iterators(&mut self, base: BaseSource) -> Result<FileGroupMergeStream> {
+    /// Whether the base file is opened after the log scan rather than before:
+    /// a merging read with a known merge schema, so the scan can say which
+    /// base columns the merge doesn't need.
+    fn defers_base_open(&self) -> bool {
+        self.input_split.has_log_files()
+            && self.input_split.base_file_path.is_some()
+            && self.schema_handler.required_schema.is_some()
+    }
+
+    async fn init_record_iterators(
+        &mut self,
+        base: Option<BaseSource>,
+    ) -> Result<FileGroupMergeStream> {
         log::debug!(
             "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
@@ -514,15 +546,6 @@ impl HoodieFileGroupReader {
                 .as_deref()
                 .unwrap_or("<none>"),
             self.input_split.log_file_paths.len(),
-        );
-
-        let BaseSource {
-            schema: base_source_schema,
-            batches: base_source,
-        } = base;
-        log::debug!(
-            "[HoodieFileGroupReader] base file source: schema_cols={}",
-            base_source_schema.fields().len(),
         );
 
         // The post-projection output schema is the same regardless of
@@ -534,6 +557,14 @@ impl HoodieFileGroupReader {
         // iterator that yields the base file batches directly.
         if self.input_split.is_base_only() {
             log::debug!("[HoodieFileGroupReader] no log files → Eager iterator");
+            let base = match base {
+                Some(base) => base,
+                None => self.base_file_source().await?,
+            };
+            let BaseSource {
+                schema: base_source_schema,
+                batches: base_source,
+            } = base;
 
             // The schema travels with the source, so it is known without
             // forcing a row-group decode. A log-only file group's source is
@@ -575,8 +606,49 @@ impl HoodieFileGroupReader {
             )
             .await?;
 
-        let record_buffer = load_result.record_buffer;
+        let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
+
+        // A deferred base file is opened now that the scan says which base
+        // columns the merge can do without. A column is left unread only when
+        // the output doesn't carry it either and no filter is evaluated on the
+        // way, since a filter may read any merge column.
+        let base = match base {
+            Some(base) => base,
+            None => {
+                let merge_schema = self.schema_handler.required_schema.clone().ok_or_else(|| {
+                    CoreError::ReadFileSliceError(
+                        "internal: a deferred base open needs the merge schema".to_string(),
+                    )
+                })?;
+                let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
+                let unfiltered = self.reader_context.row_filter_builder.is_none()
+                    && self.reader_context.row_group_selector.is_none()
+                    && self.reader_context.key_predicate.is_none();
+                self.skip_base_columns = match &post_projection_schema {
+                    Some(output) if unfiltered => unneeded
+                        .into_iter()
+                        .filter(|c| output.column_with_name(c).is_none())
+                        .filter(|c| {
+                            merge_schema
+                                .field_with_name(c)
+                                .is_ok_and(|f| f.is_nullable())
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?
+            }
+        };
+        let BaseSource {
+            schema: base_source_schema,
+            batches: base_source,
+        } = base;
+        log::debug!(
+            "[HoodieFileGroupReader] base file source: schema_cols={} skipped={:?}",
+            base_source_schema.fields().len(),
+            self.skip_base_columns,
+        );
 
         // Anything this read expects that is quietly not done, said once, before
         // the rows come back looking unremarkable. Reported here rather than on
@@ -928,6 +1000,7 @@ impl HoodieFileGroupReader {
             .clone()
             .unwrap_or_else(|| required_schema.clone());
         let repair_risk_columns = self.reader_context.repair_risk_columns.clone();
+        let skip_columns = self.skip_base_columns.clone();
         let volume = self.storage.read_volume();
         let choose_path = path.clone();
         // The open speaks storage errors; a schema decision that fails here is
@@ -960,6 +1033,10 @@ impl HoodieFileGroupReader {
                 let mut present: Vec<arrow_schema::FieldRef> =
                     Vec::with_capacity(required_schema.fields().len());
                 for rf in required_schema.fields() {
+                    // Left unread; `project_batch_to_schema` null-fills it.
+                    if skip_columns.iter().any(|c| c == rf.name()) {
+                        continue;
+                    }
                     let idx = crate::schema::batch_evolution::index_of_ci(file_schema, rf.name())
                         .map_err(&fail)?;
                     if let Some(idx) = idx {
