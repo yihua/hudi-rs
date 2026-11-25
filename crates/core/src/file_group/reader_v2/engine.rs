@@ -362,7 +362,15 @@ impl HoodieFileGroupReader {
         // Uses record_key_fields() (all key fields) instead of record_key_field()
         // (single) to support composite record keys in virtual-key mode.
         // Mirrors Java's getMandatoryFieldsForMerging() lines 250-258.
-        let has_instant_range = reader_context.instant_range.is_some();
+        // `_hoodie_commit_time` is needed only to narrow rows to a window that
+        // starts somewhere (an incremental read). The resolver always sets a
+        // range, and a snapshot read's (an end bound at most) leaves every row
+        // of the slice in, so reading the column for it decodes a string per row
+        // for nothing.
+        let has_instant_range = reader_context
+            .instant_range
+            .as_ref()
+            .is_some_and(crate::timeline::selector::InstantRange::is_bounded_below);
         schema_handler.prepare_required_schema(
             input_split.has_log_files(),
             &reader_context.record_key_fields(),
