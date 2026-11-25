@@ -40,15 +40,19 @@
 //!
 //! ## Direct merge
 //!
-//! Under commit-time ordering, with no partial-update rule and no delete
-//! marker other than `_hoodie_is_deleted`, the newest log record at a position
-//! simply replaces the base row there, and a delete simply removes it. While
-//! that holds, log blocks are kept as they arrive instead of being turned into
-//! records one by one. When the base is read, they are folded in log order into
-//! one sorted position list (a later block wins). Each base batch is then
-//! merged by finding that list's positions among the batch's row positions:
-//! the matched rows are masked out and the log rows that replace them are
-//! gathered in one call. The record map is never touched. Anything outside
+//! Under commit-time or event-time ordering, with no partial-update rule and no
+//! delete marker other than `_hoodie_is_deleted`, a log record at a position
+//! either replaces the base row there whole or leaves it, and a delete either
+//! removes it or is obsolete. While that holds, log blocks are kept as they
+//! arrive instead of being turned into records one by one. When the base is
+//! read, they are folded in log order into one sorted position list: under
+//! commit-time ordering a later block wins, under event-time ordering the fold
+//! follows the event-time merger's rules on each record's ordering value. Each
+//! base batch is then merged by finding that list's positions among the batch's
+//! row positions. Under event-time ordering the base row's ordering value is
+//! read only at those matched rows and compared with the log record's. The rows
+//! the log wins are masked out and the log rows that replace them are gathered
+//! in one call. The record map is never touched. Anything outside
 //! those conditions (a partial block, a block without usable positions, a
 //! caller using the row-at-a-time path) replays the kept blocks into the map
 //! and continues the ordinary way.
@@ -81,7 +85,7 @@ use crate::file_group::reader_v2::buffer::row_extraction::{
 };
 use crate::file_group::reader_v2::buffer::spillable_map::{SpillConfig, SpillableRecordMap};
 use crate::file_group::reader_v2::buffer::{BufferType, HoodieFileGroupRecordBuffer};
-use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord};
+use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord, OrderingValue};
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::update_processor::UpdateStats;
@@ -159,6 +163,9 @@ struct DirectIndex {
     consumed: Vec<bool>,
     /// The log data batches, reconciled to the merge schema.
     data: Vec<RecordBatch>,
+    /// Under event-time ordering, each entry's ordering value (aligned with
+    /// `entries`); empty under commit-time ordering, which never compares.
+    orderings: Vec<Option<OrderingValue>>,
     drained: bool,
     /// Counts for the read's update statistics, as the record map keeps them.
     stats: UpdateStats,
@@ -374,7 +381,10 @@ impl PositionBasedFileGroupRecordBuffer {
                 }
             })
             .sum();
-        let mut slots: HashMap<u64, DirectSlot> = HashMap::with_capacity(total);
+        let event_time = self.inner.base.record_merge_mode == "EVENT_TIME_ORDERING";
+        let record_context = &self.inner.record_context;
+        let mut slots: HashMap<u64, (DirectSlot, Option<OrderingValue>)> =
+            HashMap::with_capacity(total);
         let mut data: Vec<RecordBatch> = Vec::new();
         for block in &direct.blocks {
             match block {
@@ -382,6 +392,11 @@ impl PositionBasedFileGroupRecordBuffer {
                     let mut pos_idx = 0usize;
                     for batch in batches {
                         let deleted = built_in_delete_mask(batch);
+                        let orderings = if event_time {
+                            Some(record_context.ordering_accessor(batch)?)
+                        } else {
+                            None
+                        };
                         let batch_idx = data.len() as u32;
                         data.push(reconcile_batch_to_schema(batch, target_schema)?);
                         for row in 0..batch.num_rows() {
@@ -394,26 +409,59 @@ impl PositionBasedFileGroupRecordBuffer {
                                     row: row as u32,
                                 },
                             };
-                            slots.insert(positions[pos_idx], slot);
+                            let ordering = orderings.as_ref().and_then(|o| o.value_at(row));
+                            fold_slot(&mut slots, positions[pos_idx], slot, ordering, event_time);
                             pos_idx += 1;
                         }
                     }
                 }
-                DirectBlock::Delete { positions, .. } => {
-                    for &position in positions {
-                        slots.insert(position, DirectSlot::Delete);
+                DirectBlock::Delete { positions, batches } => {
+                    if event_time {
+                        let mut pos_idx = 0usize;
+                        for (batch, _) in batches {
+                            for (_, ordering) in
+                                record_context.delete_batch_to_keys_with_ordering(batch)?
+                            {
+                                fold_slot(
+                                    &mut slots,
+                                    positions[pos_idx],
+                                    DirectSlot::Delete,
+                                    ordering,
+                                    true,
+                                );
+                                pos_idx += 1;
+                            }
+                        }
+                    } else {
+                        for &position in positions {
+                            slots.insert(position, (DirectSlot::Delete, None));
+                        }
                     }
                 }
             }
         }
-        let mut entries: Vec<(u64, DirectSlot)> = slots.into_iter().collect();
-        entries.sort_unstable_by_key(|(position, _)| *position);
+        let mut folded: Vec<(u64, (DirectSlot, Option<OrderingValue>))> =
+            slots.into_iter().collect();
+        folded.sort_unstable_by_key(|(position, _)| *position);
+        let mut entries: Vec<(u64, DirectSlot)> = Vec::with_capacity(folded.len());
+        let mut orderings: Vec<Option<OrderingValue>> = if event_time {
+            Vec::with_capacity(folded.len())
+        } else {
+            Vec::new()
+        };
+        for (position, (slot, ordering)) in folded {
+            entries.push((position, slot));
+            if event_time {
+                orderings.push(ordering);
+            }
+        }
         let consumed = vec![false; entries.len()];
         direct.blocks.clear();
         direct.index = Some(DirectIndex {
             entries,
             consumed,
             data,
+            orderings,
             drained: false,
             stats: UpdateStats::default(),
         });
@@ -432,6 +480,11 @@ impl PositionBasedFileGroupRecordBuffer {
             return Ok(None);
         }
         let positions = base_row_position_array(base)?;
+        let base_orderings = if self.inner.base.record_merge_mode == "EVENT_TIME_ORDERING" {
+            Some(self.inner.record_context.ordering_accessor(base)?)
+        } else {
+            None
+        };
         let index = self
             .direct
             .as_mut()
@@ -463,6 +516,15 @@ impl PositionBasedFileGroupRecordBuffer {
             let Some(row) = row else {
                 continue;
             };
+            if let Some(base_orderings) = &base_orderings
+                && !log_beats_base(slot, &index.orderings[i], &base_orderings.value_at(row))
+            {
+                // The base row is newer: it stays, and the log record is spent
+                // (the record map would have removed it on this match).
+                index.consumed[i] = true;
+                index.stats.num_updates += 1;
+                continue;
+            }
             let mask = keep.get_or_insert_with(|| {
                 let mut b = BooleanBufferBuilder::new(num_rows);
                 b.append_n(num_rows, true);
@@ -754,16 +816,22 @@ impl PositionBasedFileGroupRecordBuffer {
     }
 }
 
-/// Whether the direct merge can apply to this buffer at all: commit-time
-/// ordering (the newest log record wins whole), no partial-update rule, deletes
-/// marked only by delete blocks or `_hoodie_is_deleted`, and no emitted deletes.
+/// Whether the direct merge can apply to this buffer at all: commit-time or
+/// event-time ordering (a log record wins or loses whole, decided from ordering
+/// values alone), no partial-update rule, deletes marked only by delete blocks
+/// or `_hoodie_is_deleted`, and no emitted deletes. Every other merge mode,
+/// including a custom merger or payload that needs the full rows, merges row by
+/// row through the record map.
 fn direct_merge_applies(inner: &KeyBasedFileGroupRecordBuffer, emit_delete: bool) -> bool {
     let delete_markers_ok =
         inner.base.delete_context.as_ref().is_none_or(|ctx| {
             ctx.custom_delete_marker.is_none() && ctx.hoodie_operation_pos.is_none()
         });
     !emit_delete
-        && inner.base.record_merge_mode == "COMMIT_TIME_ORDERING"
+        && matches!(
+            inner.base.record_merge_mode.as_str(),
+            "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING"
+        )
         && !inner.has_partial_update_rules()
         && delete_markers_ok
 }
@@ -774,6 +842,93 @@ fn built_in_delete_mask(batch: &RecordBatch) -> Option<BooleanArray> {
     batch
         .column_by_name("_hoodie_is_deleted")
         .and_then(|c| c.as_any().downcast_ref::<BooleanArray>().cloned())
+}
+
+/// Fold one log record into the position list. Under commit-time ordering a
+/// later record replaces an earlier one at the same position. Under event-time
+/// ordering the fold mirrors `EventTimeRecordMerger`: a later data record
+/// replaces the earlier entry when `should_keep_newer_record` would keep it, and
+/// a later delete replaces it unless `delta_merge_delete` would keep the
+/// earlier entry.
+fn fold_slot(
+    slots: &mut HashMap<u64, (DirectSlot, Option<OrderingValue>)>,
+    position: u64,
+    slot: DirectSlot,
+    ordering: Option<OrderingValue>,
+    event_time: bool,
+) {
+    match slots.entry(position) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert((slot, ordering));
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let (old_slot, old_ordering) = e.get();
+            if !event_time || newer_log_wins(*old_slot, old_ordering, slot, &ordering) {
+                e.insert((slot, ordering));
+            }
+        }
+    }
+}
+
+/// Whether a newer log record replaces an older one at the same position under
+/// event-time ordering.
+fn newer_log_wins(
+    old_slot: DirectSlot,
+    old_ordering: &Option<OrderingValue>,
+    new_slot: DirectSlot,
+    new_ordering: &Option<OrderingValue>,
+) -> bool {
+    let old_is_delete = matches!(old_slot, DirectSlot::Delete);
+    match new_slot {
+        // `delta_merge_delete`: an earlier commit-time-ordering delete stays; the
+        // earlier record survives only when the delete has a non-default ordering
+        // value of the same class that it strictly exceeds.
+        DirectSlot::Delete => {
+            if old_is_delete && is_default_ordering(old_ordering) {
+                return false;
+            }
+            !(!is_default_ordering(new_ordering)
+                && matches!((new_ordering, old_ordering),
+                    (Some(d), Some(o)) if d.is_same_class(o) && o > d))
+        }
+        // `should_keep_newer_record`: a commit-time-ordering delete on either side
+        // keeps the newer record; otherwise the newer wins on `>=` or a
+        // cross-class pair.
+        DirectSlot::Update { .. } => {
+            if old_is_delete && is_default_ordering(old_ordering) {
+                return true;
+            }
+            match (new_ordering, old_ordering) {
+                (Some(n), Some(o)) => !n.is_same_class(o) || n >= o,
+                _ => true,
+            }
+        }
+    }
+}
+
+/// Whether the folded log record at a position beats the base row there under
+/// event-time ordering. Mirrors `pick_winner`: a data record wins on `>=`, a
+/// cross-class pair or a missing ordering value; a delete applies unless it has
+/// a non-default ordering value of the base's class that the base strictly
+/// exceeds.
+fn log_beats_base(
+    slot: DirectSlot,
+    log_ordering: &Option<OrderingValue>,
+    base_ordering: &Option<OrderingValue>,
+) -> bool {
+    match slot {
+        DirectSlot::Delete => !matches!((log_ordering, base_ordering),
+            (Some(d), Some(b)) if !d.is_default() && d.is_same_class(b) && b > d),
+        DirectSlot::Update { .. } => match (log_ordering, base_ordering) {
+            (Some(l), Some(b)) => !l.is_same_class(b) || l >= b,
+            _ => true,
+        },
+    }
+}
+
+/// `None` or the null-coerced default: the natural-order ordering value.
+fn is_default_ordering(ordering: &Option<OrderingValue>) -> bool {
+    ordering.as_ref().is_none_or(|o| o.is_default())
 }
 
 /// Gather rows `(batch, row)` of `data` into one batch, in that order.
@@ -1210,19 +1365,29 @@ mod tests {
         positions: &[u64],
         base_instant_of_positions: &str,
     ) -> LogBlock {
+        let ords: Vec<Option<i64>> = keys.iter().map(|_| None).collect();
+        delete_block_with_positions_ordered(keys, &ords, positions, base_instant_of_positions)
+    }
+
+    /// Like [`delete_block_with_positions`], with each delete's ordering value.
+    fn delete_block_with_positions_ordered(
+        keys: &[&str],
+        ords: &[Option<i64>],
+        positions: &[u64],
+        base_instant_of_positions: &str,
+    ) -> LogBlock {
         let delete_schema = Arc::new(Schema::new(vec![
             Field::new("recordKey", DataType::Utf8, false),
             Field::new("partitionPath", DataType::Utf8, true),
             Field::new("orderingVal", DataType::Int64, true),
         ]));
         let parts: Vec<&str> = keys.iter().map(|_| "").collect();
-        let ords: Vec<Option<i64>> = keys.iter().map(|_| None).collect();
         let batch = RecordBatch::try_new(
             delete_schema,
             vec![
                 Arc::new(StringArray::from(keys.to_vec())),
                 Arc::new(StringArray::from(parts)),
-                Arc::new(Int64Array::from(ords)),
+                Arc::new(Int64Array::from(ords.to_vec())),
             ],
         )
         .unwrap();
@@ -1592,6 +1757,109 @@ mod tests {
         assert!(!direct.iter().any(|(k, _, _)| k == "k2" || k == "k5"));
     }
 
+    /// Under event-time ordering the direct merge returns what the position map
+    /// and the key merge return: base rows that outrank the log stay, ties go to
+    /// the log, a later but lower-ordered log record loses the fold, and a delete
+    /// with a lower non-default ordering value is obsolete while a default one
+    /// always applies.
+    #[test]
+    fn direct_merge_event_time_matches_position_and_key_merges() {
+        fn run(way: MergeWay) -> Vec<(String, i32, i64)> {
+            let event = "EVENT_TIME_ORDERING";
+            let ordering = [("hoodie.table.ordering.fields", "ts")];
+            let mut buffer = build_buffer_with(event, &ordering, &[]);
+            if matches!(way, MergeWay::RecordKey) {
+                buffer.direct = None;
+                buffer.fallback_to_key_based().unwrap();
+            }
+            // Base rows all carry ts 5.
+            // Commit 1: k1 older (3), k2 tied (5), k3 and k7 newer (9), and an
+            // update past the base (k40).
+            let mut update1 = data_block_with_positions_at_instant(
+                &[
+                    ("k1", 100, 3),
+                    ("k2", 200, 5),
+                    ("k3", 300, 9),
+                    ("k7", 700, 9),
+                    ("k40", 4000, 1),
+                ],
+                &[1, 2, 3, 7, 40],
+                BASE_INSTANT,
+                "20240101000001000",
+            );
+            buffer.process_data_block(&mut update1).unwrap();
+            // k4's delete is older than the base, k6's has no ordering value,
+            // k8's is newer.
+            let mut delete1 = delete_block_with_positions_ordered(
+                &["k4", "k6", "k8"],
+                &[Some(3), None, Some(7)],
+                &[4, 6, 8],
+                BASE_INSTANT,
+            );
+            buffer.process_delete_block(&mut delete1).unwrap();
+            // Commit 2: k7 again but older than commit 1's k7, k12 older than
+            // its base row, k15 newer.
+            let mut update2 = data_block_with_positions_at_instant(
+                &[("k7", 777, 6), ("k12", 1200, 1), ("k15", 1500, 8)],
+                &[7, 12, 15],
+                BASE_INSTANT,
+                "20240101000002000",
+            );
+            buffer.process_data_block(&mut update2).unwrap();
+            // k3's delete is older than commit 1's k3, k9's is newer than base.
+            let mut delete2 = delete_block_with_positions_ordered(
+                &["k3", "k9"],
+                &[Some(8), Some(10)],
+                &[3, 9],
+                BASE_INSTANT,
+            );
+            buffer.process_delete_block(&mut delete2).unwrap();
+            match way {
+                MergeWay::Direct => assert!(buffer.direct.is_some()),
+                MergeWay::PositionMap => buffer.leave_direct().unwrap(),
+                MergeWay::RecordKey => {
+                    assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge)
+                }
+            }
+            let keys: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+            let rows: Vec<(&str, i32, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i as i32, 5))
+                .collect();
+            let target = schema();
+            let mut all: Vec<RecordBatch> = Vec::new();
+            for (range, start) in [(0..10, 0u64), (10..15, 10), (15..20, 15)] {
+                let batch = base_batch_at(&rows[range], start);
+                if let Some(out) = buffer.merge_base_batch(&batch, &target).unwrap() {
+                    all.push(out);
+                }
+            }
+            while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+                all.push(b);
+            }
+            let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+            let mut out = extract(&merged);
+            out.sort();
+            out
+        }
+        let direct = run(MergeWay::Direct);
+        assert_eq!(direct, run(MergeWay::PositionMap));
+        assert_eq!(direct, run(MergeWay::RecordKey));
+        let has = |k: &str, c: i32, t: i64| direct.contains(&(k.to_string(), c, t));
+        assert!(has("k1", 1, 5), "an older log record loses to the base row");
+        assert!(has("k2", 200, 5), "a tie goes to the log");
+        assert!(has("k3", 300, 9), "an older delete loses to the newer log update");
+        assert!(has("k4", 4, 5), "a delete older than the base row is obsolete");
+        assert!(has("k7", 700, 9), "the higher-ordered log record wins the fold");
+        assert!(has("k12", 12, 5));
+        assert!(has("k15", 1500, 8));
+        assert!(has("k40", 4000, 1), "an update past the base is emitted");
+        for gone in ["k6", "k8", "k9"] {
+            assert!(!direct.iter().any(|(k, _, _)| k == gone), "{gone} is deleted");
+        }
+    }
+
     /// A data block that would reach the direct merge in each fallback case
     /// below: it updates position 2 and is followed by a delete of position 5.
     fn fallback_blocks(base_instant_of_positions: &str, partial: bool) -> (LogBlock, LogBlock) {
@@ -1718,16 +1986,43 @@ mod tests {
         assert_eq!(out, reference);
         assert!(reads_key(&mut partial));
 
-        // Event-time ordering never starts the direct merge.
+        // Event-time ordering takes the direct merge too, and matches the key
+        // merge without reading the record key.
         let event = "EVENT_TIME_ORDERING";
         let ordering = [("hoodie.table.ordering.fields", "ts")];
         let event_buffer = build_buffer_with(event, &ordering, &[]);
-        assert!(event_buffer.direct.is_none());
+        assert!(event_buffer.direct.is_some());
         let blocks = fallback_blocks(BASE_INSTANT, false);
         let (out, mut event_buffer) = merge_ten_rows(event_buffer, blocks);
         let reference = key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false));
         assert_eq!(out, reference);
-        assert!(reads_key(&mut event_buffer));
+        assert!(!reads_key(&mut event_buffer));
+
+        // Event-time ordering with positions from another base file falls back.
+        let blocks = fallback_blocks(other, false);
+        let (out, mut event_fallback) =
+            merge_ten_rows(build_buffer_with(event, &ordering, &[]), blocks);
+        let reference = key_merged(event, &ordering, fallback_blocks(other, false));
+        assert!(event_fallback.direct.is_none());
+        assert_eq!(out, reference);
+        assert!(reads_key(&mut event_fallback));
+
+        // A custom merger decides from whole rows, so it stays on the row path.
+        let custom = build_buffer_with(
+            "CUSTOM",
+            &[
+                (
+                    "hoodie.compaction.payload.class",
+                    "org.apache.hudi.metadata.HoodieMetadataPayload",
+                ),
+                (
+                    "hoodie.record.merge.strategy.id",
+                    "00000000-0000-0000-0000-000000000000",
+                ),
+            ],
+            &[],
+        );
+        assert!(custom.direct.is_none());
 
         // `hoodie.merge.use.record.positions=false` builds a key-based buffer,
         // which needs every merge column from the base file.
