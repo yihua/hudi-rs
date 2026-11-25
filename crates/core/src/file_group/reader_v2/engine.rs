@@ -810,7 +810,7 @@ impl HoodieFileGroupReader {
             _ => None,
         };
         let scan = {
-            let loader = DefaultFileGroupRecordBufferLoader::new();
+            let loader = self.record_buffer_loader;
             let context = self.reader_context.clone();
             let storage = self.storage.clone();
             let split = self.input_split.clone();

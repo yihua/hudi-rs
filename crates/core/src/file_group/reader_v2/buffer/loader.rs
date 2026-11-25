@@ -86,7 +86,7 @@ pub trait FileGroupRecordBufferLoader: Send + Sync + std::fmt::Debug {
 /// use_record_position && base_file?  → PositionBasedFileGroupRecordBuffer ★
 /// DEFAULT         → KeyBasedFileGroupRecordBuffer ★
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct DefaultFileGroupRecordBufferLoader;
 
 impl DefaultFileGroupRecordBufferLoader {
